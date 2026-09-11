@@ -166,6 +166,41 @@ def classifier_source(oww_model: str,
     return p if p.is_file() else None
 
 
+def effective_stop_model(configured: str | None,
+                         models_dir: Path | None = None) -> str:
+    """
+    The `stopModel` a device should actually be told to run.
+
+    The stop word is OPTIONAL: an empty value means "off", and the controller
+    then neither requires the device to report a ready stop classifier nor
+    arms one for a response. Two spellings collapse to off:
+
+      * an explicitly empty/blank `stopModel`, and
+      * the built-in name ("stop") when no stop classifier can be resolved —
+        neither bundled in the image (BUILTIN_STOP_PATH) nor supplied beside
+        the database (<models_dir>/stop.onnx). A deployment built from this
+        repository without the maintainer's private model must not be left
+        with every voice turn refused as "stop word unavailable".
+
+    A custom `.onnx` path is returned as-is even if the file is missing: the
+    device may already carry it, and the existing asset-reconcile/dashboard
+    paths report that case by name. A deployment with the built-in model in
+    place is unaffected — "stop" resolves and is returned unchanged.
+    """
+    name = (configured or "").strip()
+    if not name:
+        return ""
+    if name == em_oww_models.BUILTIN_STOP_MODEL:
+        if models_dir is None:
+            try:
+                models_dir = em_oww_models.models_dir()
+            except Exception:
+                models_dir = None
+        if classifier_source(name, models_dir=models_dir) is None:
+            return ""
+    return name
+
+
 @dataclass
 class Asset:
     """One file that should exist on the device."""

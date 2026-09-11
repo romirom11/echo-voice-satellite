@@ -32,6 +32,7 @@ SECTIONS: dict[str, dict] = {
         "keys": [
             "owwModel", "owwThreshold",
             "bargeInEnabled", "bargeInThreshold", "wakeArbitrationMs",
+            "noSpeechTimeoutMs", "wakeReplayFrames",
             "saveWakeCaptures", "wakeCaptureSec",
             "wakeNearMissFloor",
         ],

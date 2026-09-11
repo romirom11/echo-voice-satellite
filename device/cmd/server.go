@@ -132,6 +132,13 @@ func main() {
 	ctx := context.Background()
 
 	dataClient := client.NewDataClient(deviceID, microphone, pcmSpeaker)
+	// A mute persisted in state.json is restored by NewServer before any
+	// data connection exists. Mirror it now, so connect()'s automatic wake
+	// stream start honours it — otherwise a muted boot ran the wake stream
+	// against a muted ADC and the eventual unmute found it "already active".
+	if s.IsMuted() {
+		dataClient.SetMuted(true)
+	}
 	controlClient := client.NewControlClient(
 		deviceID,
 		func(leds []led.Led, listening *bool) {
@@ -360,8 +367,8 @@ func main() {
 				}
 				return 0.05
 			}(),
-			snap.StopModel,
-			shadow.ClassifierMD5(snap.StopModel),
+			snap.StopModelName(),
+			shadow.ClassifierMD5(snap.StopModelName()),
 		)
 		reportStopStatus(dataClient, controlClient)
 		if msg.SendspinServer != "" {
@@ -472,14 +479,25 @@ func main() {
 	// review C5 fix sequence) — deliberately not guessed at here.
 	s.SetMuteChangeCallback(func(muted bool) {
 		controlClient.SendMuteState(muted)
-		if muted {
-			dataClient.StopMic()
-		} else {
-			// Restore the permanent OWW listening stream on unmute — no
-			// lock_mic, matching the normal idle state. If the controller
-			// also sends its own mic_start around the same time, StartMic
-			// is idempotent (ignores the call while already active).
-			dataClient.StartMic(false)
+		// The data client owns the software half of mute (see
+		// DataClient.SetMuted): muting stops the running stream and refuses
+		// every StartMic — including connect()'s automatic wake-stream
+		// start on a data reconnect, which the old StopMic/StartMic pair
+		// inherited from the tinyalsa build never covered — and unmuting
+		// restarts the permanent wake stream from scratch (fresh mic
+		// subscription, scorer Reset, empty detector ring, NO controller
+		// grant). Calling StartMic here instead could land on a stream the
+		// reconnect path had restarted while muted and turn unmute into a
+		// phantom "controller:start" grant that streamed live audio to a
+		// controller with no turn to receive it.
+		dataClient.SetMuted(muted)
+		if !muted {
+			if sc := dataClient.ShadowScorer(); sc == nil {
+				log.Printf("[wake] unmuted with no local detector (%s) — config push needed",
+					wakeState.lastErr)
+			} else {
+				log.Printf("[wake] unmuted — local detection resumes (%s)", sc.Info())
+			}
 		}
 	})
 
@@ -966,9 +984,16 @@ var stopState struct {
 // live, preserving the idle CPU budget and keeping wake behavior independent.
 func applyStopConfig(dc *client.DataClient) {
 	snap := config.Get().Snapshot()
-	if snap.StopModel == "" {
+	stopModel := snap.StopModelName()
+	if stopModel == "" {
+		// Cleared (or never set): the stop word is off by configuration.
+		// Reachable from a live push since "stopModel": "" now decodes as
+		// an explicit clear (config.ConfigMessage.StopModel is a pointer).
 		if dc.StopScorer() != nil {
 			dc.SetStopScorer(nil)
+		}
+		if stopState.model != "" || stopState.lastErr != "" {
+			log.Println("[stopword] disabled — no stop model configured")
 		}
 		stopState.model, stopState.lastErr = "", ""
 		dc.SetSharedStop(false)
@@ -977,14 +1002,14 @@ func applyStopConfig(dc *client.DataClient) {
 	// A combined scorer is installed by applyWakeConfig when local wake
 	// scoring is enabled. Never replace it with a second feature pipeline.
 	if dc.SharedStop() {
-		stopState.model, stopState.lastErr = snap.StopModel, ""
+		stopState.model, stopState.lastErr = stopModel, ""
 		return
 	}
-	if sc := dc.StopScorer(); sc != nil && stopState.model == snap.StopModel {
+	if sc := dc.StopScorer(); sc != nil && stopState.model == stopModel {
 		sc.SetThreshold(float32(snap.StopThreshold))
 		return
 	}
-	sc, err := shadow.Open(snap.StopModel, float32(snap.StopThreshold), func(score, threshold float32, at time.Time, _ uint16) {
+	sc, err := shadow.Open(stopModel, float32(snap.StopThreshold), func(score, threshold float32, at time.Time, _ uint16) {
 		dc.HandleStopCrossing(score, threshold, at)
 	})
 	if err != nil {
@@ -993,28 +1018,37 @@ func applyStopConfig(dc *client.DataClient) {
 			log.Printf("[stopword] not started: %v", err)
 		}
 		dc.SetStopScorer(nil)
-		stopState.model = snap.StopModel
+		stopState.model = stopModel
 		return
 	}
 	dc.SetStopScorer(sc)
 	dc.SetSharedStop(false)
-	stopState.model, stopState.lastErr = snap.StopModel, ""
+	stopState.model, stopState.lastErr = stopModel, ""
 	log.Printf("[stopword] local scoring ready (%s, threshold %.2f)", sc.Info(), snap.StopThreshold)
 }
 
 // reportStopStatus runs after both scorer reconciliation paths. With local wake
 // enabled, the stop head belongs to ShadowScorer; otherwise it is standalone.
+//
+// No stop model configured is reported as DISABLED (ready=false, model="",
+// reason="disabled", no error): the controller asked for no stop classifier,
+// so "stop word: off" is the truthful status, not "stop scorer unavailable".
 func reportStopStatus(dc *client.DataClient, cc *client.ControlClient) {
 	snap := config.Get().Snapshot()
+	stopModel := snap.StopModelName()
+	if stopModel == "" {
+		cc.SendStopDisabled()
+		return
+	}
 	ready := dc.SharedStop() || dc.StopScorer() != nil
 	errMsg := stopState.lastErr
-	if !ready && snap.StopModel != "" && errMsg == "" {
+	if !ready && errMsg == "" {
 		errMsg = wakeState.lastErr
 	}
-	if !ready && snap.StopModel != "" && errMsg == "" {
+	if !ready && errMsg == "" {
 		errMsg = "stop scorer unavailable"
 	}
-	cc.SendStopStatus(ready, snap.StopModel, errMsg)
+	cc.SendStopStatus(ready, stopModel, errMsg)
 }
 
 // applyWakeConfig starts or re-points mandatory on-device wake word scoring.
@@ -1026,9 +1060,13 @@ func applyWakeConfig(dc *client.DataClient, cc *client.ControlClient,
 	snap := config.Get().Snapshot()
 	model := snap.OwwModel
 	threshold := float32(snap.OwwThreshold)
+	stopModel := snap.StopModelName()
 
-	// Already running for this model: thresholds change live.
-	if sc := dc.ShadowScorer(); sc != nil && wakeState.model == model && wakeState.stopModel == snap.StopModel {
+	// Already running for this model: thresholds change live. The stop
+	// model is part of the identity — clearing it (stopModel "") rebuilds
+	// the scorer on the wake-only path below, and setting one rebuilds it
+	// with the shared head.
+	if sc := dc.ShadowScorer(); sc != nil && wakeState.model == model && wakeState.stopModel == stopModel {
 		sc.SetThreshold(threshold)
 		sc.SetScoreCallback(dc.ObserveWakeScore)
 		if snap.BargeInEnabled != nil && *snap.BargeInEnabled && spk != nil {
@@ -1040,18 +1078,35 @@ func applyWakeConfig(dc *client.DataClient, cc *client.ControlClient,
 		return
 	}
 
+	onCross := func(score, crossed float32, at time.Time, sequence uint16) {
+		onWakeCrossing(dc, cc, srv, score, crossed, at, sequence)
+	}
 	var sc *shadow.Scorer
 	var err error
-	if snap.StopModel != "" {
-		sc, err = shadow.OpenWithHead(model, threshold, func(score, crossed float32, at time.Time, sequence uint16) {
-			onWakeCrossing(dc, cc, srv, score, crossed, at, sequence)
-		}, snap.StopModel, float32(snap.StopThreshold), dc.StopArmed, func(score, crossed float32, at time.Time, _ uint16) {
-			dc.HandleStopCrossing(score, crossed, at)
-		}, dc.ObserveStopScore)
+	sharedStop := false
+	if stopModel != "" {
+		sc, err = shadow.OpenWithHead(model, threshold, onCross,
+			stopModel, float32(snap.StopThreshold), dc.StopArmed,
+			func(score, crossed float32, at time.Time, _ uint16) {
+				dc.HandleStopCrossing(score, crossed, at)
+			}, dc.ObserveStopScore)
+		if err != nil {
+			// The stop head failing to load must not take wake detection
+			// down with it: fall back to the wake-only scorer and let
+			// reportStopStatus carry the stop error. Before this, a device
+			// whose stop classifier was not installed reported "wake
+			// detector unavailable: shadow: stop classifier model not
+			// installed" and answered to nothing at all.
+			if msg := err.Error(); msg != stopState.lastErr {
+				stopState.lastErr = msg
+				log.Printf("[stopword] shared head not started: %v — running wake-only", err)
+			}
+			sc, err = shadow.Open(model, threshold, onCross)
+		} else {
+			sharedStop = true
+		}
 	} else {
-		sc, err = shadow.Open(model, threshold, func(score, crossed float32, at time.Time, sequence uint16) {
-			onWakeCrossing(dc, cc, srv, score, crossed, at, sequence)
-		})
+		sc, err = shadow.Open(model, threshold, onCross)
 	}
 	if err != nil {
 		if msg := err.Error(); msg != wakeState.lastErr {
@@ -1059,7 +1114,7 @@ func applyWakeConfig(dc *client.DataClient, cc *client.ControlClient,
 			log.Printf("[shadow] not started: %v", err)
 		}
 		dc.SetShadowScorer(nil)
-		wakeState.model, wakeState.stopModel = model, snap.StopModel
+		wakeState.model, wakeState.stopModel = model, stopModel
 		dc.SetSharedStop(false)
 		cc.SendWakeStatus(false, model, "", err.Error())
 		return
@@ -1072,13 +1127,14 @@ func applyWakeConfig(dc *client.DataClient, cc *client.ControlClient,
 	}
 	sc.SetScoreCallback(dc.ObserveWakeScore)
 	dc.SetShadowScorer(sc)
-	if snap.StopModel != "" {
+	if sharedStop {
 		dc.SetStopScorer(nil)
 		dc.SetSharedStop(true)
+		stopState.model, stopState.lastErr = stopModel, ""
 	} else {
 		dc.SetSharedStop(false)
 	}
-	wakeState.model, wakeState.stopModel, wakeState.lastErr = model, snap.StopModel, ""
+	wakeState.model, wakeState.stopModel, wakeState.lastErr = model, stopModel, ""
 	cc.SendWakeStatus(true, model, shadow.ClassifierMD5(model), "")
 	log.Printf("[wake] local detection ready (%s, threshold %.2f)", sc.Info(), threshold)
 }

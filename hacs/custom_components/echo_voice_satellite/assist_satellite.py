@@ -75,6 +75,11 @@ class EchoAssistSatellite(EchoCoordinatorEntity, AssistSatelliteEntity):
         self._offer_lock = asyncio.Lock()
         self._transcript_sent = False
         self._endpoint_sent = False
+        # One `speech-start` per turn: HA's VAD fires STT_VAD_START once per
+        # pipeline run, but the guard keeps a re-run or a duplicate event
+        # from spamming the controller (which only relays the first one to
+        # the device anyway).
+        self._speech_start_sent = False
         self._continue_conversation = False
         self._tool_calls: dict[str, dict[str, Any]] = {}
         self._tool_call_sequence = 0
@@ -292,6 +297,7 @@ class EchoAssistSatellite(EchoCoordinatorEntity, AssistSatelliteEntity):
             self._active_turn_token = token
             self._transcript_sent = False
             self._endpoint_sent = False
+            self._speech_start_sent = False
             self._continue_conversation = False
             self._tool_calls = {}
             self._tool_call_sequence = 0
@@ -522,7 +528,22 @@ class EchoAssistSatellite(EchoCoordinatorEntity, AssistSatelliteEntity):
             return
         event_type = event.type
         try:
-            if event_type == PipelineEventType.STT_END:
+            if event_type == PipelineEventType.STT_VAD_START:
+                # HA's own VAD heard speech begin. Relay it as the turn's
+                # first speech evidence: the device ends a granted turn on
+                # its own after noSpeechTimeoutMs unless the controller
+                # disarms that deadline, and until now the only disarm
+                # trigger was a transcript. An STT provider that returns a
+                # single final transcript 6-8s after the utterance (a
+                # Gemini Live bridge) never produces one in time, so every
+                # turn — continuations included — ended as no_speech. This
+                # event is independent of the STT provider. STT_START is
+                # deliberately NOT used: it fires as soon as STT begins,
+                # speech or not, and would defeat the deadline entirely.
+                if not self._speech_start_sent:
+                    self._speech_start_sent = True
+                    await self.client.async_turn_action(turn_id, "speech-start")
+            elif event_type == PipelineEventType.STT_END:
                 if not self._transcript_sent:
                     text = (event.data or {}).get("stt_output", {}).get("text")
                     if isinstance(text, str) and text:

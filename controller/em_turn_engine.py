@@ -131,6 +131,14 @@ class Turn:
     # longer applies ("no_speech_disarm"). Guards against re-sending on
     # every partial of a long utterance.
     no_speech_disarmed: bool = False
+    # Set by the `speech-start` turn action: HA's own VAD (STT_VAD_START)
+    # heard speech, whether or not the STT provider has produced any text
+    # yet. Speech evidence that arrives before a transcript — the case for
+    # providers that return only a final transcript several seconds after
+    # the utterance (a Gemini Live bridge), which is exactly when the
+    # device's no-speech deadline would otherwise win.
+    speech_started: bool = False
+    speech_start_mono: float | None = None
     # Legacy discard knob retained for callers that still need it. Normal wake
     # turns use initial_audio for sequence-addressed preroll instead.
     preroll_remaining: int = 0
@@ -323,6 +331,31 @@ async def _disarm_stop(turn: Turn) -> None:
     await turn.device.send_control({"type": "stop_disarm", "generation": generation})
 
 
+async def _disarm_no_speech(turn: Turn) -> None:
+    """
+    Tell the device its no-speech deadline no longer applies to this turn.
+
+    The device ends a granted turn on its own after noSpeechTimeoutMs of
+    silence unless it hears this. It cannot see what HA hears — neither
+    HA's VAD nor HA's partial transcripts — so the controller relays the
+    first evidence of speech, whichever arrives first:
+
+      * `speech-start` (HA's STT_VAD_START, independent of the STT provider),
+      * a partial or final `transcript`.
+
+    Sent at most once per turn (`no_speech_disarmed`). A continuation turn
+    is a NEW Turn (trigger_voice_turn creates one per pipeline run, after
+    em_controller's `device.mic_start()` re-armed the device's timer), so
+    the guard resets per grant by construction and the disarm for the new
+    epoch goes out as soon as HA hears the follow-up. Old firmware ignores
+    the unknown message type, per the capability rule.
+    """
+    if turn.no_speech_disarmed:
+        return
+    turn.no_speech_disarmed = True
+    await turn.device.send_control({"type": "no_speech_disarm"})
+
+
 async def turn_action(request: web.Request) -> web.Response:
     try:
         turn_id = int(request.match_info["tid"])
@@ -371,17 +404,26 @@ async def turn_action(request: web.Request) -> web.Response:
             else:
                 log.debug("[%s] partial transcript text=%r", turn.device.device_id, text)
             turn.stt_text = text
-            if not turn.no_speech_disarmed:
-                # First speech evidence this turn: the device's 5s
-                # no-speech deadline no longer applies — it cannot hear
-                # HA's partials, so without this it would end (and, on
-                # newer firmware, stop streaming) a turn HA is actively
-                # transcribing. One message per turn; old firmware
-                # ignores the unknown type, per the capability rule.
-                turn.no_speech_disarmed = True
-                await turn.device.send_control({"type": "no_speech_disarm"})
+            # Speech evidence: the device's no-speech deadline no longer
+            # applies — it cannot hear HA's partials, so without this it
+            # would end (and, on newer firmware, stop streaming) a turn HA
+            # is actively transcribing. Kept alongside `speech-start` for
+            # pipelines where HA's VAD does not run.
+            await _disarm_no_speech(turn)
             if turn.on_transcript is not None:
                 await turn.on_transcript(text)
+    elif action == "speech-start":
+        # HA's VAD (STT_VAD_START) heard the user start speaking. This is
+        # the provider-independent evidence: an STT engine that only
+        # returns a final transcript 6-8s later (Pipecat's Gemini Live
+        # bridge) never produces a partial before the device's deadline,
+        # and every turn — continuations included — was lost as no_speech.
+        if not turn.speech_started:
+            turn.speech_started = True
+            turn.speech_start_mono = time.monotonic()
+            log.debug("[%s] speech start (HA VAD) turn=%d",
+                      turn.device.device_id, turn_id)
+        await _disarm_no_speech(turn)
     elif action == "tts-text":
         try:
             body = await request.json()
@@ -449,21 +491,25 @@ async def _send_mic(turn: Turn) -> None:
                 continue
             if payload is None or isinstance(payload, str):
                 if payload == VAD_SENTINEL_TIMEOUT:
-                    if turn.stt_text:
+                    if turn.stt_text or turn.speech_started:
                         # Speech evidence already arrived from HA (partial
-                        # transcripts): the device's 5s deadline lost a race
-                        # it was never meant to win, not a silent room. Turn
-                        # 650 transcribed its full command as partials with
-                        # the final STT ~1s behind the deadline; treating
-                        # that as "nothing said" skipped the TTS wait, so no
-                        # timer and no answer. Fall through to the normal
+                        # transcripts, or its VAD via `speech-start`): the
+                        # device's deadline lost a race it was never meant
+                        # to win, not a silent room. Turn 650 transcribed
+                        # its full command as partials with the final STT
+                        # ~1s behind the deadline; treating that as
+                        # "nothing said" skipped the TTS wait, so no timer
+                        # and no answer. Fall through to the normal
                         # end-of-speech path (EOS below lets the pipeline
                         # finalize) and wait for HA's response like any
-                        # other turn.
+                        # other turn. Firmware that honours
+                        # no_speech_disarm never sends this sentinel after
+                        # the disarm; older firmware still does.
                         log.info(
-                            "[%s] no-speech timeout with %d chars already "
-                            "transcribed — waiting for HA response",
-                            getattr(turn.device, "device_id", "?"), len(turn.stt_text),
+                            "[%s] no-speech timeout with speech already heard "
+                            "by HA (%d chars transcribed) — waiting for HA response",
+                            getattr(turn.device, "device_id", "?"),
+                            len(turn.stt_text or ""),
                         )
                     else:
                         # No speech was ever detected — mirrors em_esphome's old

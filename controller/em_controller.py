@@ -597,6 +597,31 @@ class Device:
         """Whether firmware can locally flush and report an armed stop word."""
         return "stopword" in (self.capabilities or [])
 
+    @property
+    def stop_word_enabled(self) -> bool:
+        """
+        Whether this device is configured to run a stop word at all.
+
+        Empty `stopModel` (explicitly, or because the built-in classifier is
+        not available to this controller — em_oww_assets.effective_stop_model
+        resolves that at config push) means the stop word is OFF: nothing is
+        armed for responses, and nothing is required before admitting one.
+        """
+        return bool((self.stop_model or "").strip())
+
+    @property
+    def stop_admissible(self) -> bool:
+        """
+        The stop-word gate every voice response passes through.
+
+        With a stop word configured it is mandatory protection: firmware must
+        declare the capability and have reported the configured model ready.
+        With the stop word off there is nothing to be ready — the gate passes.
+        """
+        if not self.stop_word_enabled:
+            return True
+        return self.stopword_capable and self.stop_model_ready
+
     async def send_led_anim(self, anim: dict):
         """
         Hand the ring to the device's local animation engine (led_anim
@@ -1335,10 +1360,11 @@ async def _run_voice_locked(device: Device, trigger_label: str = "unknown", is_w
     trace display, not a control-flow key) so a future change to the label
     format can't silently change behaviour here.
     """
-    # Stop is mandatory protection for every voice response. Do this before
-    # interrupting music or lighting the ring: a visible turn that then cannot
-    # answer safely is worse than refusing it at the boundary.
-    if not device.stopword_capable or not device.stop_model_ready:
+    # A configured stop word is mandatory protection for every voice response.
+    # Do this before interrupting music or lighting the ring: a visible turn
+    # that then cannot answer safely is worse than refusing it at the
+    # boundary. With the stop word off (empty stopModel) the gate passes.
+    if not device.stop_admissible:
         log.warning("[%s] voice response refused: stop word unavailable", device.device_id)
         return False
     drained = 0
@@ -1754,7 +1780,7 @@ async def handle_button_event(device: Device, event: dict):
             if device.wake_request_id is not None:
                 await deny_button("busy")
                 return
-            if not device.stopword_capable or not device.stop_model_ready:
+            if not device.stop_admissible:
                 await deny_button("not_ready")
                 return
             if device.data_ws is None:
@@ -1768,8 +1794,7 @@ async def handle_button_event(device: Device, event: dict):
                     _devices.get(device.device_id) is device
                     and not device.muted
                     and device.data_ws is not None
-                    and device.stopword_capable
-                    and device.stop_model_ready
+                    and device.stop_admissible
                     and asyncio.get_running_loop().time() < button_deadline
                 )
 
@@ -1894,11 +1919,42 @@ def _make_admission_valid(device: Device, deadline: float):
             and not device.muted
             and device.data_ws is not None
             and device.oww_model_ready
-            and device.stopword_capable
-            and device.stop_model_ready
+            and device.stop_admissible
             and asyncio.get_running_loop().time() < deadline
         )
     return admission_valid
+
+
+def resolve_stop_model_for_push(device: Device, config: dict) -> str:
+    """
+    The `stopModel` value a config push should carry for this device.
+
+    Delegates the policy to em_oww_assets.effective_stop_model (empty = off;
+    the built-in name with no classifier the controller can supply = off) and
+    logs the downgrade once per device so a deployment without the model
+    sees WHY its stop word is off instead of a silent absence. The returned
+    value is always a string — "" included — because the device clears an
+    installed stop model only on an explicitly present empty key.
+    """
+    # A missing key means the fleet default (the built-in name), exactly as
+    # the pre-optional `config.get("stopModel", "stop")` read it; only an
+    # explicitly empty value is "off" by choice.
+    configured = config.get("stopModel", em_oww_models.BUILTIN_STOP_MODEL)
+    configured = str(configured or "")
+    effective = em_oww_assets.effective_stop_model(configured)
+    if effective != configured and not getattr(device, "_stop_off_logged", False):
+        device._stop_off_logged = True
+        log.warning(
+            "[%s] stop word OFF: stopModel %r has no classifier this controller "
+            "can supply (no %s and no stop.onnx upload) — responses will not be "
+            "interruptible by the stop word; upload a stop model or set "
+            "stopModel to \"\" to silence this",
+            device.device_id, configured, em_oww_models.BUILTIN_STOP_PATH,
+        )
+    elif not effective and not getattr(device, "_stop_off_logged", False):
+        device._stop_off_logged = True
+        log.info("[%s] stop word OFF (stopModel is empty)", device.device_id)
+    return effective
 
 
 def _wake_request_admission_gate(device: Device) -> str | None:
@@ -1995,7 +2051,7 @@ async def _handle_wake_request(device: Device, msg: dict) -> None:
         )
         return
 
-    if not device.stopword_capable or not device.stop_model_ready:
+    if not device.stop_admissible:
         await deny("not_ready")
         return
 
@@ -2183,9 +2239,14 @@ async def handle_control(ws: WebSocketServerProtocol, secure: bool = False):
             config["sendspinServer"] = await loop.run_in_executor(
                 None, db.get_config, "music_assistant_url", MUSIC_ASSISTANT_URL
             ) or ""
+        # The stop word is optional. Resolve the configured model to what the
+        # device should actually run and ALWAYS include the key: an explicit
+        # "" is how the device clears a previously installed stop model, so
+        # it must not be dropped as an empty value.
+        config["stopModel"] = resolve_stop_model_for_push(device, config)
         await device.send_control({"type": "config", **config})
         device.oww_model     = config.get("owwModel", DEFAULT_WAKE_MODEL)
-        device.stop_model    = config.get("stopModel", "stop")
+        device.stop_model    = config["stopModel"]
         device.stop_threshold = float(config.get("stopThreshold", 0.75))
         device.wake_arb_ms   = int(config.get("wakeArbitrationMs", 300))
         device.save_utterances = bool(config.get("saveUtterances", False))
@@ -2639,12 +2700,20 @@ async def handle_control(ws: WebSocketServerProtocol, secure: bool = False):
                 elif msg_type == "stop_status":
                     model = msg.get("model")
                     ready = msg.get("ready")
-                    device.stop_model_ready = bool(ready) and model == device.stop_model
-                    if device.stop_model_ready:
-                        log.info("[%s] stop word ready: %s", device_id, model)
+                    if not device.stop_word_enabled:
+                        # Stop word is off: the device's "not ready / no
+                        # model" report is the expected state, not a fault.
+                        # Nothing is ever ready, and nothing gates on it.
+                        device.stop_model_ready = False
+                        log.info("[%s] stop word off (device reports model=%r ready=%s)",
+                                 device_id, model or "", bool(ready))
                     else:
-                        log.warning("[%s] stop word unavailable: %s", device_id,
-                                    msg.get("error") or "model mismatch")
+                        device.stop_model_ready = bool(ready) and model == device.stop_model
+                        if device.stop_model_ready:
+                            log.info("[%s] stop word ready: %s", device_id, model)
+                        else:
+                            log.warning("[%s] stop word unavailable: %s", device_id,
+                                        msg.get("error") or "model mismatch")
 
                 elif msg_type == "wake_status":
                     checksum = msg.get("classifierMd5")

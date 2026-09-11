@@ -1681,12 +1681,24 @@ async def _apply_live_config(device_id: str, live, effective: dict) -> None:
     locally until the classifier is actually on it — see _hold_back_oww_model.
     """
     effective, pending_model = _hold_back_oww_model(live, effective)
+    if "stopModel" in effective:
+        # Same optional-stop-word policy as the connect-time push in
+        # em_controller: "" (off) is sent as an explicit empty key so the
+        # device clears an installed model, never dropped.
+        effective["stopModel"] = em_oww_assets.effective_stop_model(
+            str(effective.get("stopModel") or "")
+        )
     await live.send_control({"type": "config", **effective})
     if "owwModel" in effective:
         live.oww_model = effective["owwModel"]
         # Refresh HA's wake-word dropdown.
         ha_sidechannels.wake_model(device_id, effective["owwModel"])
     if "stopModel" in effective:
+        if effective["stopModel"] != live.stop_model:
+            # A different model must prove itself ready again via
+            # stop_status; with the stop word off there is nothing to be
+            # ready (stop_admissible passes without it).
+            live.stop_model_ready = False
         live.stop_model = effective["stopModel"]
     if "stopThreshold" in effective:
         live.stop_threshold = float(effective["stopThreshold"])
@@ -4453,8 +4465,11 @@ def _oww_wanted_models(device_id: str) -> list[str]:
     """
     cfg = db.get_effective_device_config(device_id) or {}
     wake = (cfg.get("owwModel") or "").strip()
-    stop = (cfg.get("stopModel") or "").strip()
-    # Ordered: active wake first, mandatory stop second. A duplicate is one
+    # A stop word that resolves to "off" (empty, or the built-in name with no
+    # classifier to supply) wants no asset — planning must not report it as
+    # a missing model the device could never receive.
+    stop = em_oww_assets.effective_stop_model(cfg.get("stopModel"))
+    # Ordered: active wake first, stop second. A duplicate is one
     # file, but selecting a wake model as a stop model is rejected by callers.
     return list(dict.fromkeys(model for model in (wake, stop) if model))
 
@@ -4745,6 +4760,13 @@ async def _post_oww_assets(request: web.Request) -> web.Response:
 
 
 
+def _fleet_wanted_models(fleet: dict) -> list[str]:
+    """Fleet wake model plus the stop model, with an "off" stop word omitted."""
+    wake = (fleet.get("owwModel") or "").strip()
+    stop = em_oww_assets.effective_stop_model(fleet.get("stopModel"))
+    return [m for m in (wake, stop) if m]
+
+
 @auth.require_auth
 async def _get_provision_oww_manifest(request: web.Request) -> web.Response:
     """
@@ -4756,7 +4778,7 @@ async def _get_provision_oww_manifest(request: web.Request) -> web.Response:
     destination as the field path — only the transport differs.
     """
     fleet = db.get_global_device_config() or {}
-    models = [m for m in [fleet.get("owwModel") or "", fleet.get("stopModel") or ""] if m]
+    models = _fleet_wanted_models(fleet)
     desired, problems = em_oww_assets.desired_assets(models)
     return _ok({
         "dir": em_oww_assets.DEVICE_DIR,
@@ -4776,8 +4798,7 @@ async def _get_provision_oww_asset(request: web.Request) -> web.Response:
     """
     name = request.match_info["name"]
     fleet = db.get_global_device_config() or {}
-    desired, _ = em_oww_assets.desired_assets(
-        [m for m in [fleet.get("owwModel") or "", fleet.get("stopModel") or ""] if m])
+    desired, _ = em_oww_assets.desired_assets(_fleet_wanted_models(fleet))
     asset = next((a for a in desired if a.name == name), None)
     if asset is None:
         return _error("not_found", f"{name} is not a current asset", 404)
@@ -5417,6 +5438,10 @@ def _merge_device(row) -> dict:
         "wakeModelReady": getattr(live, "oww_model_ready", False) if live else False,
         "stopwordCapable": getattr(live, "stopword_capable", False) if live else False,
         "stopModelReady": getattr(live, "stop_model_ready", False) if live else False,
+        # False = the stop word is OFF for this device (empty stopModel, or
+        # the built-in model is not available to this controller) — nothing
+        # is required of the device and nothing is armed; not a fault.
+        "stopWordEnabled": getattr(live, "stop_word_enabled", True) if live else None,
         "audioMixCapable": getattr(live, "audio_mix_capable", False) if live else False,
         # Gates the tap-as-event toggle — see em_button.decide.
         "buttonHoldCapable": getattr(live, "button_hold_capable", False) if live else False,

@@ -279,16 +279,27 @@ func TestOnWakeGrantRegistersCallback(t *testing.T) {
 }
 
 func TestStopStatusMessageIncludesReadinessModelAndOptionalError(t *testing.T) {
-	ready := stopStatusMessage(true, "stop_v1", "")
+	ready := stopStatusMessage(true, "stop_v1", "", "")
 	if ready["type"] != "stop_status" || ready["ready"] != true || ready["model"] != "stop_v1" {
 		t.Fatalf("ready status = %#v", ready)
 	}
 	if _, ok := ready["error"]; ok {
 		t.Fatalf("ready status unexpectedly has error: %#v", ready)
 	}
-	failed := stopStatusMessage(false, "stop_v1", "model missing")
+	if _, ok := ready["reason"]; ok {
+		t.Fatalf("ready status unexpectedly has reason: %#v", ready)
+	}
+	failed := stopStatusMessage(false, "stop_v1", "model missing", "")
 	if failed["ready"] != false || failed["error"] != "model missing" {
 		t.Fatalf("failed status = %#v", failed)
+	}
+	// A cleared stop model is OFF, not broken: no error, an explicit reason.
+	disabled := stopStatusMessage(false, "", "", stopStatusReasonDisabled)
+	if disabled["ready"] != false || disabled["model"] != "" || disabled["reason"] != "disabled" {
+		t.Fatalf("disabled status = %#v", disabled)
+	}
+	if _, ok := disabled["error"]; ok {
+		t.Fatalf("disabled status must not carry an error: %#v", disabled)
 	}
 }
 
@@ -399,7 +410,7 @@ func TestConnectDispatchesControlMessagesAndAppliesConfig(t *testing.T) {
 	if got := config.Get().VadThreshold; got != 0.123 {
 		t.Fatalf("config VadThreshold = %v", got)
 	}
-	if snap := config.Get().Snapshot(); snap.StopModel != "stop_v1" || snap.StopThreshold != 0.8 {
+	if snap := config.Get().Snapshot(); snap.StopModelName() != "stop_v1" || snap.StopThreshold != 0.8 {
 		t.Fatalf("stop config = %+v", snap)
 	}
 }

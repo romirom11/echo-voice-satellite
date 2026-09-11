@@ -4994,7 +4994,7 @@ const STAGE_MONO = "'DM Mono',monospace";
 // be silently wrong.
 const CONFIG_SECTIONS = {
   "playback": ["eqBands", "eqLoudness", "ttsGainDb", "duckDb", "limiterEnabled", "limiterRelease", "bassGuardEnabled", "bassGuardDb"],
-  "wakeword": ["owwModel", "owwThreshold", "bargeInEnabled", "bargeInThreshold", "wakeArbitrationMs", "saveWakeCaptures", "wakeCaptureSec", "wakeNearMissFloor"],
+  "wakeword": ["owwModel", "owwThreshold", "bargeInEnabled", "bargeInThreshold", "wakeArbitrationMs", "noSpeechTimeoutMs", "wakeReplayFrames", "saveWakeCaptures", "wakeCaptureSec", "wakeNearMissFloor"],
   "stopword": ["stopModel", "stopThreshold", "saveStopCaptures", "stopCaptureSec", "stopNearMissFloor"],
   "microphones": ["afeMicGainDb", "saveUtterances"],
   "ring": ["ledScene", "ledListenColor", "ledThinkColor", "meterAttack", "meterDecay", "meterFloor", "meterGamma", "meterRef", "meterCurve"],
@@ -5189,6 +5189,14 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
   const stopThresholdVal = Number(Number(config.stopThreshold ?? 0.75).toFixed(2));
   const stopNearMissFloor = Number(Number(config.stopNearMissFloor ?? 0.05).toFixed(2));
   const stopFloorConflict = stopNearMissFloor >= stopThresholdVal;
+  // '' is an explicit "off"; a missing key means the fleet default ("stop").
+  const stopModelSelected = config.stopModel ?? 'stop';
+  const stopModelAvailable = customModels.some(m => m.kind === 'stop'
+    && (m.path === stopModelSelected || m.name === stopModelSelected) && m.available !== false);
+  // Mirrors em_oww_assets.effective_stop_model: off when explicitly empty, or
+  // when the built-in "stop" is selected but this controller has no classifier
+  // to push for it. A custom path that is missing is an error, not "off".
+  const stopWordOff = stopModelSelected === '' || (stopModelSelected === 'stop' && !stopModelAvailable);
 
   const bands = config.eqBands ?? [0,0,0,0,0,0,0,0];
   const RING_SCENES = [
@@ -5401,6 +5409,8 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
                 </div>
               )}
               <Slider label="Arbitration window" sub="ms that the first Echo to hear you silences the others — no added delay; 0 disables" value={config.wakeArbitrationMs ?? 700} min={0} max={2000} step={50} unit="ms" onChange={v => set('wakeArbitrationMs', v)}/>
+              <Slider label="No-speech timeout" sub="ms the Echo waits for you to speak after a wake, tap or follow-up before ending the turn on its own; disarmed as soon as Home Assistant hears speech, so raise it only if turns end before a slow STT engine reports anything. 0 = off" value={config.noSpeechTimeoutMs ?? 5000} min={0} max={15000} step={500} unit="ms" onChange={v => set('noSpeechTimeoutMs', v)}/>
+              <Slider label="Wake replay" sub="mic frames (80ms each) from before the activation replayed into the turn so words spoken in the same breath as the wake word are kept — the tail of the wake phrase rides along and a literal STT engine will transcribe it. 0 = none: keeps the wake phrase out of the transcript, may clip a fast first word" value={config.wakeReplayFrames ?? 25} min={0} max={60} step={1} unit="fr" onChange={v => set('wakeReplayFrames', v)}/>
                <Toggle label="Save wake captures" sub="keeps short clips of activations and near-misses to label and retrain — writes speech to disk; review under Settings → Training" value={config.saveWakeCaptures ?? false} onChange={v => set('saveWakeCaptures', v)}/>
               {(config.saveWakeCaptures ?? false) && (
                 <Slider label="Capture length" sub="seconds of audio before each detection to keep" value={config.wakeCaptureSec ?? 2.0} min={0.5} max={5.0} step={0.5} unit="s" onChange={v => set('wakeCaptureSec', v)}/>
@@ -5413,15 +5423,18 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
       {/* 03 STOP WORD */}
       <Stage n="03" title="Stop word"
         chips={<><ScopeChip tone="controller">Controller</ScopeChip><ScopeChip tone="device">Echo</ScopeChip></>}
-        desc="Mandatory local interruption for voice responses, announcements, and timer alerts. Stop is never disabled; the model is installed before the Echo is armed."
+        desc="Local interruption for voice responses, announcements, and timer alerts. With a model selected it is mandatory: the model is installed and reported ready before the Echo is allowed to answer. Select Off to run without a stop word — responses then end only by themselves, the wake word (barge-in) or the button."
         scope={scopeEl('stopword')} dim={secStyle('stopword')}>
         <div style={{ maxWidth: 620 }}>
-          <Select label="Stop model" value={config.stopModel || 'stop'}
-            options={customModels.filter(m => m.kind === 'stop').map(m => ({
-              value: m.path || m.name,
-              label: `${m.name}${m.available === false ? ' (missing)' : ''}`,
-              disabled: m.available === false,
-            }))}
+          <Select label="Stop model" value={stopWordOff ? '' : stopModelSelected}
+            options={[
+              { value: '', label: 'Off' },
+              ...customModels.filter(m => m.kind === 'stop').map(m => ({
+                value: m.path || m.name,
+                label: `${m.name}${m.available === false ? ' (missing)' : ''}`,
+                disabled: m.available === false,
+              })),
+            ]}
             onChange={v => set('stopModel', v)}/>
           <label className="em-pill em-pill--small" style={{ display: 'inline-block', cursor: 'pointer', marginBottom: 10 }}>
             Upload stop ONNX
@@ -5454,10 +5467,16 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
           {!stopwordCapable && (
             <div className="em-label" style={{ color: 'var(--error)', marginTop: -8 }}>Unsupported firmware: this Echo does not declare the required stopword capability.</div>
           )}
-          {!customModels.some(m => m.kind === 'stop' && (m.path === (config.stopModel || 'stop') || m.name === (config.stopModel || 'stop')) && m.available !== false) && (
-            <div className="em-label" style={{ color: 'var(--error)', marginTop: -8 }}>Stop model missing. Voice responses require a ready model.</div>
+          {stopWordOff ? (
+            <div className="em-label" style={{ marginTop: -8 }}>
+              {stopModelSelected === ''
+                ? 'Stop word is off: nothing is armed during responses and nothing is required of the Echo before it answers.'
+                : 'Stop word is off: the built-in "stop" model is not available on this controller (the image was built without it and none has been uploaded), so the controller pushes no stop model. Upload one to turn the stop word on, or select Off to make this explicit.'}
+            </div>
+          ) : !stopModelAvailable && (
+            <div className="em-label" style={{ color: 'var(--error)', marginTop: -8 }}>Stop model missing. Voice responses require a ready model, or select Off.</div>
           )}
-          <div className="em-label" style={{ marginTop: 6 }}>Requires stopword-capable firmware, installed runtime/model assets, and the paired Amazon AFE route. There is no disable switch.</div>
+          <div className="em-label" style={{ marginTop: 6 }}>A selected model requires stopword-capable firmware, installed runtime/model assets, and the paired Amazon AFE route.</div>
         </div>
       </Stage>
 

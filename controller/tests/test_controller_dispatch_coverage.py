@@ -1250,7 +1250,7 @@ def test_handle_control_survives_turn_history_hydration_failure(monkeypatch):
 
 # ─── handle_control: the main per-message dispatch loop ───────────────────
 
-def test_handle_control_dispatches_every_message_type_and_closes_stale_on_teardown(monkeypatch):
+def test_handle_control_dispatches_every_message_type_and_closes_stale_on_teardown(monkeypatch, bundled_stop_model):
     """
     One long-lived connection driven through nearly every branch of
     handle_control's message loop that the existing tests (the register/ack
@@ -1908,3 +1908,88 @@ def test_button_admission_valid_closure_is_exercised_by_a_real_turn(monkeypatch)
     finally:
         em_controller._devices = old_devices
     assert seen == [True]  # device registered, unmuted, data plane up, deadline not yet passed
+
+
+# ── Optional stop word: gates pass when it is off ──────────────────────────
+
+def test_stop_admissible_requires_a_ready_model_only_when_one_is_configured():
+    device = new_device(["wake_request_v1", "stopword"])
+    device.stop_model = "stop"
+    device.stop_model_ready = False
+    assert device.stop_word_enabled is True
+    assert device.stop_admissible is False
+    device.stop_model_ready = True
+    assert device.stop_admissible is True
+
+    # Off: nothing can be ready, and nothing needs to be.
+    device.stop_model = ""
+    device.stop_model_ready = False
+    assert device.stop_word_enabled is False
+    assert device.stop_admissible is True
+    # Off does not even need the firmware capability.
+    incapable = new_device(["wake_request_v1"])
+    incapable.stop_model = ""
+    assert incapable.stop_admissible is True
+
+
+def test_handle_wake_request_admits_when_the_stop_word_is_off(monkeypatch):
+    """The mirror of test_handle_wake_request_denies_when_stop_word_not_ready:
+    an unready model only denies while a model is configured."""
+    device = _wake_ready_device(stop_model="", stop_model_ready=False)
+    sent = []
+    device.send_control = lambda m: asyncio.sleep(0, result=sent.append(m))
+    ran = []
+
+    async def fake_run_voice_locked(*args, **kwargs):
+        ran.append(kwargs.get("request_id"))
+
+    monkeypatch.setattr(em_controller, "_run_voice_locked", fake_run_voice_locked)
+    old_devices = em_controller._devices
+    em_controller._devices = {device.device_id: device}
+    try:
+        run(em_controller._handle_wake_request(device, {
+            "requestId": "req-1", "score": 0.9, "threshold": 0.5, "ageMs": 1,
+            "activationSeq": 1, "source": "wakeword", "model": device.oww_model,
+        }))
+    finally:
+        em_controller._devices = old_devices
+    assert not any(m.get("reason") == "not_ready" for m in sent)
+    assert ran == ["req-1"]
+
+
+def test_admission_valid_passes_with_the_stop_word_off():
+    device = _wake_ready_device(stop_model="", stop_model_ready=False)
+    old_devices = em_controller._devices
+    em_controller._devices = {device.device_id: device}
+    try:
+        async def check():
+            valid = em_controller._make_admission_valid(
+                device, asyncio.get_running_loop().time() + 4.0)
+            return valid()
+        assert run(check()) is True
+    finally:
+        em_controller._devices = old_devices
+
+
+def test_resolve_stop_model_for_push_always_returns_a_string(tmp_path, monkeypatch):
+    """The device clears an installed stop model only on an explicitly
+    present empty key, so the push must carry "" rather than drop it."""
+    import em_oww_models
+    device = new_device(["wake_request_v1", "stopword"])
+    absent = tmp_path / "absent" / "stop.onnx"
+    monkeypatch.setattr(em_oww_models, "BUILTIN_STOP_PATH", absent)
+    monkeypatch.setattr(em_oww_models, "models_dir", lambda: tmp_path)
+    # Explicitly off.
+    assert em_controller.resolve_stop_model_for_push(device, {"stopModel": ""}) == ""
+    # Built-in name, no classifier anywhere: off, with the key still present.
+    assert em_controller.resolve_stop_model_for_push(device, {"stopModel": "stop"}) == ""
+    # Missing key reads as the fleet default, same as before.
+    assert em_controller.resolve_stop_model_for_push(device, {}) == ""
+    # Maintainer's setup: bundled model, unchanged.
+    absent.parent.mkdir(parents=True)
+    absent.write_bytes(b"onnx")
+    assert em_controller.resolve_stop_model_for_push(device, {"stopModel": "stop"}) == "stop"
+    assert em_controller.resolve_stop_model_for_push(device, {}) == "stop"
+    # A custom path is passed through.
+    assert em_controller.resolve_stop_model_for_push(
+        device, {"stopModel": "/data/x.onnx"}) == "/data/x.onnx"

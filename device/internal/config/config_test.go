@@ -1,8 +1,10 @@
 package config
 
 import (
+	"encoding/json"
 	"sync"
 	"testing"
+	"time"
 )
 
 func boolPtr(b bool) *bool        { return &b }
@@ -95,12 +97,13 @@ func TestApplyIgnoresZeroFields(t *testing.T) {
 func TestApplySetsProvidedFields(t *testing.T) {
 	d := &Device{initialised: true}
 	mg := 12
+	stopModel := "stop_v1"
 	d.Apply(ConfigMessage{
 		VadThreshold:     0.02,
 		VadSpeechMs:      250,
 		VadSilenceMs:     500,
 		OwwModel:         "new_model",
-		StopModel:        "stop_v1",
+		StopModel:        &stopModel,
 		StopThreshold:    0.77,
 		BargeInThreshold: 0.3,
 		StartupVolume:    64,
@@ -343,5 +346,111 @@ func TestApplyAndSnapshotAreSafeConcurrently(t *testing.T) {
 	wg.Wait()
 	if d.Snapshot().VadThreshold <= 0 {
 		t.Fatalf("concurrent Apply/Snapshot left an invalid threshold")
+	}
+}
+
+// TestApplyStopModelAbsentKeepsAndEmptyClears pins the wire contract the
+// controller relies on to turn the stop word OFF: an absent "stopModel" key
+// leaves the current model alone (partial push), while an explicit "" clears
+// it. Decoded from JSON rather than built as a struct so the presence
+// distinction is exercised through the real decoder.
+func TestApplyStopModelAbsentKeepsAndEmptyClears(t *testing.T) {
+	d := &Device{initialised: true, StopModel: "stop_v1"}
+
+	var absent ConfigMessage
+	if err := json.Unmarshal([]byte(`{"type":"config","owwThreshold":0.6}`), &absent); err != nil {
+		t.Fatal(err)
+	}
+	d.Apply(absent)
+	if d.StopModel != "stop_v1" {
+		t.Fatalf("absent stopModel changed the model: %q", d.StopModel)
+	}
+	if got := d.Snapshot().StopModelName(); got != "stop_v1" {
+		t.Fatalf("Snapshot().StopModelName() = %q, want stop_v1", got)
+	}
+
+	var cleared ConfigMessage
+	if err := json.Unmarshal([]byte(`{"type":"config","stopModel":""}`), &cleared); err != nil {
+		t.Fatal(err)
+	}
+	if cleared.StopModel == nil || *cleared.StopModel != "" {
+		t.Fatalf("explicit empty stopModel decoded as %v, want pointer to \"\"", cleared.StopModel)
+	}
+	d.Apply(cleared)
+	if d.StopModel != "" {
+		t.Fatalf("explicit empty stopModel did not clear the model: %q", d.StopModel)
+	}
+	if got := d.Snapshot().StopModelName(); got != "" {
+		t.Fatalf("Snapshot().StopModelName() after clear = %q, want empty", got)
+	}
+	if (ConfigMessage{}).StopModelName() != "" {
+		t.Fatal("nil StopModel must read as empty")
+	}
+}
+
+// TestNoSpeechTimeoutAndWakeReplayFramesConfig covers the two turn-shaping
+// knobs added for slow STT providers: defaults preserve the historical
+// behaviour (5s deadline, 25-frame preroll), explicit zero is honoured
+// (timer off / replay from the activation frame only), absent keys leave
+// the values alone, and out-of-range values are clamped.
+func TestNoSpeechTimeoutAndWakeReplayFramesConfig(t *testing.T) {
+	d := &Device{}
+	d.mu.Lock()
+	d.loadDefaults()
+	d.mu.Unlock()
+	if d.NoSpeechTimeoutMs != DefaultNoSpeechTimeoutMs || d.WakeReplayFrames != DefaultWakeReplayFrames {
+		t.Fatalf("defaults = %d ms / %d frames, want %d / %d",
+			d.NoSpeechTimeoutMs, d.WakeReplayFrames, DefaultNoSpeechTimeoutMs, DefaultWakeReplayFrames)
+	}
+	snap := d.Snapshot()
+	if snap.NoSpeechTimeout() != 5*time.Second || snap.WakeReplayFrameCount() != 25 {
+		t.Fatalf("snapshot defaults = %v / %d", snap.NoSpeechTimeout(), snap.WakeReplayFrameCount())
+	}
+
+	var msg ConfigMessage
+	if err := json.Unmarshal([]byte(`{"type":"config","noSpeechTimeoutMs":8000,"wakeReplayFrames":0}`), &msg); err != nil {
+		t.Fatal(err)
+	}
+	d.Apply(msg)
+	if d.NoSpeechTimeoutMs != 8000 || d.WakeReplayFrames != 0 {
+		t.Fatalf("after push = %d ms / %d frames, want 8000 / 0", d.NoSpeechTimeoutMs, d.WakeReplayFrames)
+	}
+	snap = d.Snapshot()
+	if snap.NoSpeechTimeout() != 8*time.Second || snap.WakeReplayFrameCount() != 0 {
+		t.Fatalf("snapshot after push = %v / %d", snap.NoSpeechTimeout(), snap.WakeReplayFrameCount())
+	}
+
+	// Absent keys: a partial push must not reset either value.
+	var partial ConfigMessage
+	if err := json.Unmarshal([]byte(`{"type":"config","owwThreshold":0.6}`), &partial); err != nil {
+		t.Fatal(err)
+	}
+	d.Apply(partial)
+	if d.NoSpeechTimeoutMs != 8000 || d.WakeReplayFrames != 0 {
+		t.Fatalf("partial push changed values: %d ms / %d frames", d.NoSpeechTimeoutMs, d.WakeReplayFrames)
+	}
+
+	// Explicit zero timeout disables the timer.
+	zero := 0
+	d.Apply(ConfigMessage{NoSpeechTimeoutMs: &zero})
+	if d.NoSpeechTimeoutMs != 0 || d.Snapshot().NoSpeechTimeout() != 0 {
+		t.Fatalf("zero timeout not honoured: %d", d.NoSpeechTimeoutMs)
+	}
+
+	// Clamping: negatives read as 0, huge values are capped, replay frames
+	// can never exceed what the detector ring can hold.
+	neg, huge := -1, 10_000_000
+	d.Apply(ConfigMessage{NoSpeechTimeoutMs: &neg, WakeReplayFrames: &huge})
+	if d.NoSpeechTimeoutMs != 0 || d.WakeReplayFrames != MaxWakeReplayFrames {
+		t.Fatalf("clamp = %d ms / %d frames", d.NoSpeechTimeoutMs, d.WakeReplayFrames)
+	}
+	d.Apply(ConfigMessage{NoSpeechTimeoutMs: &huge, WakeReplayFrames: &neg})
+	if d.NoSpeechTimeoutMs != MaxNoSpeechTimeoutMs || d.WakeReplayFrames != 0 {
+		t.Fatalf("clamp = %d ms / %d frames", d.NoSpeechTimeoutMs, d.WakeReplayFrames)
+	}
+
+	// Method fallbacks on a message that never carried the fields.
+	if (ConfigMessage{}).NoSpeechTimeout() != 5*time.Second || (ConfigMessage{}).WakeReplayFrameCount() != 25 {
+		t.Fatal("nil-field accessors must return the defaults")
 	}
 }

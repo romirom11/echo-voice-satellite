@@ -229,6 +229,35 @@ whichever device heard you *best*. That was dropped: it taxed every wake by
 signal-to-noise winner produced a *worse* transcript than the device that
 simply heard you first.
 
+### No-speech timeout
+`noSpeechTimeoutMs`, default 5000. How long the Echo waits for you to say
+something after a turn is granted — a wake word, a button tap, or a
+follow-up question the assistant asked — before it ends the turn on its own
+as *no speech*, the way an Alexa goes quiet again if you say the wake word
+and nothing else.
+
+The timer is **disarmed by the controller as soon as Home Assistant hears
+you**: the HACS integration relays Home Assistant's own voice-activity
+detection (`STT_VAD_START`) as a `speech-start` turn action, and any
+transcript (partial or final) does the same. That relay is independent of
+which speech-to-text engine the pipeline uses, so a slow engine that returns a
+single final transcript six to eight seconds after you finish (a Gemini Live
+bridge, for instance) no longer loses every turn to this timer — including
+follow-up turns, which re-arm it. Raise it only if turns still end before
+speech is detected; `0` turns the device-side timer off entirely (the
+controller's own 30s ceiling on a turn still applies).
+
+### Wake replay
+`wakeReplayFrames`, default 25 (80ms mic frames, so about two seconds).
+When the device detects the wake word it replays this many buffered frames
+from *before* the activation into the turn, so the words you said in the same
+breath as the wake word are not clipped. The tail of the wake phrase itself
+rides along in that replay: a literal speech-to-text engine will transcribe
+"hey jarvis turn on the light" rather than "turn on the light", and a
+conversation agent may then answer the wake phrase. Set it to `0` to replay
+nothing — the wake phrase stays out of the transcript, at the cost of
+occasionally clipping a fast talker's first word.
+
 ### Sensitivity (Precise ↔ Eager)
 The confidence bar the recogniser must clear.
 
@@ -323,6 +352,27 @@ Three things the device-side detector needs:
 The stopword ("stop" during a response) and barge-in (interrupting by saying
 the wake word over playback) are scored the same way — on the device, against
 the same AFE capture stream.
+
+### Stop word (optional)
+The **Stop word** section selects the local interruption model (`stopModel`)
+that lets you say "stop" over a response, an announcement or a timer alert.
+With a model selected it is mandatory protection: the controller will not
+admit a wake, a button turn or a voice response until the Echo reports that
+model ready, and the dashboard says so when it is missing.
+
+It is **optional**. Select **Off** (an empty `stopModel`) and the controller
+requires nothing of the device, arms nothing during responses, and reports
+the stop word as off rather than as an error (`stopWordEnabled: false` on the
+device status). Responses then end by themselves, by barge-in with the wake
+word, or by the button.
+
+The fleet default is the built-in `stop` model, which the published
+controller image bundles at `/app/models/stopword/stop.onnx`. A controller
+built from source without that file (or without a `stop.onnx` uploaded from
+the Stop word section) has no classifier to install, so the default resolves
+to **off** and the log says why on each device connect. Uploading a stop
+model turns it back on; nothing else changes for a deployment that has the
+model.
 
 ### Speech-to-text (Gemini 3.5 Transcribe, HACS)
 
@@ -581,7 +631,7 @@ These are set once, on the server, and need a controller restart to change:
 |---|---|
 | `SERVER_IP` | The controller computer's LAN IP — what devices are told to connect to. Leave it empty to detect it from this host; the controller refuses to start rather than advertise an address it had to guess at, and warns if the detected one looks like a container bridge. |
 | `DEVICE_APPROVAL` | `strict` (you approve every new device — recommended) or `auto`. |
-| `MUSIC_ASSISTANT_URL` | Music Assistant Sendspin endpoint pushed to native Echo devices. |
+| `MUSIC_ASSISTANT_URL` | Music Assistant Sendspin endpoint pushed to native Echo devices. This is the **deployment default only**: the value in the dashboard's Settings page (`music_assistant_url`, stored in the controller database) takes precedence once it has been saved there, and is what devices are actually sent from then on — change it there, not in `.env`, after first setup. |
 | `SERVER_TLS_PORT` | Encrypted device link (wss) port — default 8770, `0` disables. Devices switch to it automatically once they hold pushed credentials (wizard install, or the **Secure link** button on the device Status tab). |
 | `REQUIRE_DEVICE_TLS` | Set to `1` **only after every device shows "wss (TLS)"** on its Status tab — from then on the controller rejects unencrypted or tokenless device connections. |
 | `EM_EXTRA_CA_CERT` | Path to a PEM CA certificate to trust — only needed if Home Assistant is served over HTTPS with your own internal certificate authority. See below. |

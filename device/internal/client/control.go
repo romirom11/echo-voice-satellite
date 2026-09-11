@@ -1100,10 +1100,23 @@ func (c *ControlClient) SendStopDetected(turnID string, generation uint64, phase
 // A missing model/runtime is explicit rather than being mistaken for a ready
 // device that simply has not detected anything yet.
 func (c *ControlClient) SendStopStatus(ready bool, model, errMsg string) {
-	_ = c.writeJSON(stopStatusMessage(ready, model, errMsg))
+	_ = c.writeJSON(stopStatusMessage(ready, model, errMsg, ""))
 }
 
-func stopStatusMessage(ready bool, model, errMsg string) map[string]interface{} {
+// SendStopDisabled reports that no stop model is configured: the stop word is
+// OFF by configuration, not broken. ready=false with model="" and
+// reason="disabled" — and no "error" key — so the controller can render
+// "stop word: off" instead of a fault, and must not gate turn admission on a
+// classifier the device was told not to run.
+func (c *ControlClient) SendStopDisabled() {
+	_ = c.writeJSON(stopStatusMessage(false, "", "", stopStatusReasonDisabled))
+}
+
+// stopStatusReasonDisabled is the "reason" a stop_status carries when the
+// controller cleared the stop model (config "stopModel": "").
+const stopStatusReasonDisabled = "disabled"
+
+func stopStatusMessage(ready bool, model, errMsg, reason string) map[string]interface{} {
 	msg := map[string]interface{}{
 		"type":  "stop_status",
 		"ready": ready,
@@ -1111,6 +1124,9 @@ func stopStatusMessage(ready bool, model, errMsg string) map[string]interface{} 
 	}
 	if errMsg != "" {
 		msg["error"] = errMsg
+	}
+	if reason != "" {
+		msg["reason"] = reason
 	}
 	return msg
 }

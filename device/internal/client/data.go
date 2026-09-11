@@ -7,6 +7,7 @@ import (
 	"log"
 	"math"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -102,8 +103,15 @@ const (
 // ─── VAD constants ────────────────────────────────────────────────────────────
 
 const (
-	vadOwwChunkBytes  = 1280 * 2 // 2560 bytes = 80ms
-	turnPrerollFrames = 25       // 2 seconds of local detector history
+	vadOwwChunkBytes = 1280 * 2 // 2560 bytes = 80ms
+	// turnPrerollFrames is the historical number of detector frames replayed
+	// from BEFORE the wake activation when a wake turn is granted (2s). It
+	// is now only the default: the controller tunes the live value through
+	// config.WakeReplayFrames ("wakeReplayFrames"), because STT providers
+	// that transcribe literally put the wake phrase itself into the
+	// transcript ("Hey Jarvis, ...") when the whole 2s is replayed. 0 replays
+	// from the activation frame onward only.
+	turnPrerollFrames = config.DefaultWakeReplayFrames
 
 	// prerollBudgetMs is how much pre-gate audio is retained while the VAD
 	// gate is closed and flushed upstream the moment it opens. The ring is
@@ -117,29 +125,49 @@ const (
 	// gate-open.
 	prerollBudgetMs = 512
 
-	// noSpeechTimeout bounds how long a granted turn may run without any
-	// sign of speech before streamMic ends it via frameTypeNoSpeechTimeout
-	// rather than sitting open indefinitely — mirrors Alexa's behaviour of
-	// giving up quickly on a wake word followed by silence, rather than
-	// depending on the upstream pipeline's own (much longer, HA VAD-driven)
-	// timeout. Only guards the "never spoke" case: the controller sends
-	// "no_speech_disarm" with the first transcript partial (see
-	// DisarmNoSpeech), and a disarmed grant is never ended here — HA is
+	// noSpeechTimeout is the DEFAULT bound on how long a granted turn may run
+	// without any sign of speech before streamMic ends it via
+	// frameTypeNoSpeechTimeout rather than sitting open indefinitely —
+	// mirrors Alexa's behaviour of giving up quickly on a wake word followed
+	// by silence, rather than depending on the upstream pipeline's own (much
+	// longer, HA VAD-driven) timeout. Only guards the "never spoke" case: the
+	// controller sends "no_speech_disarm" with the first transcript partial
+	// (see DisarmNoSpeech), and a disarmed grant is never ended here — HA is
 	// demonstrably transcribing, so end-of-turn is owned upstream.
-	noSpeechTimeout = 5 * time.Second
+	//
+	// The live value comes from config.NoSpeechTimeoutMs ("noSpeechTimeoutMs"
+	// on the config push): STT providers that only produce a transcript after
+	// 6-8s (Pipecat's Gemini Live bridge, batch Whisper) never get to send
+	// the disarm before a fixed 5s deadline, and every turn died as
+	// no_speech. 0 disables the device-side timer.
+	noSpeechTimeout = time.Duration(config.DefaultNoSpeechTimeoutMs) * time.Millisecond
 )
 
-// noSpeechTimeoutForTest overrides noSpeechTimeout when non-zero — set only
-// from tests, to avoid needing a real 5s wait per test run. Left at its
-// zero value in production; streamMic falls back to the real constant.
+// noSpeechTimeoutForTest overrides the configured deadline when non-zero —
+// set only from tests, to avoid needing a real 5s wait per test run. Left at
+// its zero value in production; streamMic reads the configured value.
 var noSpeechTimeoutForTest time.Duration
 
+// effectiveNoSpeechTimeout returns the deadline to arm for a freshly granted
+// turn, re-read from config on every call so a push that lands mid-stream
+// applies to the next grant. 0 means "do not arm".
 func effectiveNoSpeechTimeout() time.Duration {
 	if noSpeechTimeoutForTest > 0 {
 		return noSpeechTimeoutForTest
 	}
-	return noSpeechTimeout
+	return config.Get().Snapshot().NoSpeechTimeout()
 }
+
+// wakeReplayFrames returns how many pre-activation detector frames GrantMic
+// replays, from config (see turnPrerollFrames).
+func wakeReplayFrames() int {
+	return config.Get().Snapshot().WakeReplayFrameCount()
+}
+
+// micStallWarn is how long streamMic tolerates receiving no mic frames while
+// active before logging a stall (see the watchdog in streamMic). A var so a
+// test can shrink it.
+var micStallWarn = 5 * time.Second
 
 func vadPeriodRMS(mono []byte) float64 {
 	n := len(mono) / 2
@@ -185,6 +213,17 @@ type DataClient struct {
 	spk      speaker.Speaker
 
 	readyCh chan string
+
+	// muted mirrors the device's hardware mute (internal/server mute.go).
+	// While set, StartMic refuses to spawn a mic stream from ANY caller —
+	// the unmute path, a controller mic_start, or connect()'s automatic
+	// wake-stream start on a data reconnect — so a reconnect that happens
+	// while the ring is red cannot quietly restart capture, and the unmute
+	// StartMic then cannot land on an "already active" stream and turn into
+	// a phantom controller grant (see SetMuted). Mute itself stays
+	// hardware-authoritative: the ADC is muted by the server package; this
+	// flag only governs the software stream.
+	muted atomic.Bool
 
 	micMu     sync.Mutex
 	micActive bool
@@ -259,7 +298,10 @@ func (d *DataClient) GrantMic(requestID string, activationSeq uint16, replay boo
 		return false
 	}
 	if replay {
-		frames, complete := d.localRing.SnapshotFrom(activationSeq, turnPrerollFrames)
+		// Pre-activation frames are controller-tunable (wakeReplayFrames);
+		// SnapshotFrom keeps its "never bridge a sequence gap" rule whatever
+		// the count, and 0 replays the activation frame onward only.
+		frames, complete := d.localRing.SnapshotFrom(activationSeq, wakeReplayFrames())
 		if !complete {
 			return false
 		}
@@ -507,7 +549,52 @@ func (d *DataClient) NotifyReady(serverAddr string) {
 	}
 }
 
+// SetMuted mirrors the hardware mute into the data client. Muting stops any
+// running mic stream (wake detector included — the ADC is muted, so scoring
+// silence would only burn ~31ms of inference per 80ms frame for nothing) and
+// blocks every StartMic until unmute. Unmuting restarts the permanent wake
+// stream from scratch: a fresh mic subscription, a fresh detector ring and a
+// scorer Reset, and — unlike calling StartMic on a stream that survived —
+// no controller grant, so nothing leaves the device until a real wake.
+//
+// This replaces the StopMic/StartMic pair cmd used to call from the mute
+// callback. That pair was inherited from the tinyalsa build and had two
+// holes on the AFE path: connect() starts the wake stream on every data
+// reconnect regardless of mute, so a reconnect while muted (or a boot with a
+// persisted mute) left a stream running that unmute's StartMic then treated
+// as "already active" and GRANTED to the controller ("controller:start"),
+// streaming live audio upstream with no turn to receive it until the
+// no-speech deadline ended the phantom grant.
+func (d *DataClient) SetMuted(muted bool) {
+	d.muted.Store(muted)
+	if muted {
+		d.StopMic()
+		log.Println("[data] muted — mic stream stopped, StartMic refused until unmute")
+		return
+	}
+	// Belt and braces: nothing should be active here (StartMic refuses
+	// while muted), but a stream that raced the flag is torn down rather
+	// than inherited so the wake detector always restarts clean.
+	d.StopMic()
+	d.StartMic(false)
+	d.micMu.Lock()
+	active := d.micActive
+	d.micMu.Unlock()
+	if active {
+		log.Println("[data] unmuted — wake stream restarted")
+	} else {
+		log.Println("[data] unmuted — no data connection yet; wake stream starts on connect")
+	}
+}
+
+// Muted reports the mirrored hardware mute state.
+func (d *DataClient) Muted() bool { return d.muted.Load() }
+
 func (d *DataClient) StartMic(lockMic bool) {
+	if d.muted.Load() {
+		log.Println("[data] StartMic refused — device is muted")
+		return
+	}
 	d.micMu.Lock()
 	defer d.micMu.Unlock()
 	if d.micActive {
@@ -900,11 +987,25 @@ func (d *DataClient) streamMic(conn *websocket.Conn, stopCh <-chan struct{}, loc
 		}
 		noSpeechTimer, noSpeechTimerC = nil, nil
 	}
+	// The deadline is re-read from config at every arm, so a push that
+	// changes noSpeechTimeoutMs mid-stream governs the next grant without
+	// a stream restart. A configured 0 leaves the timer unarmed for that
+	// grant: end-of-turn is then entirely upstream's (HACS endpoint / the
+	// controller's own turn timeouts), which is what slow-STT setups want.
 	armNoSpeechTimer := func() {
 		stopNoSpeechTimer()
-		noSpeechTimer = time.NewTimer(effectiveNoSpeechTimeout())
+		timeout := effectiveNoSpeechTimeout()
+		if timeout <= 0 {
+			log.Println("[data] streamMic: no-speech deadline disabled by config — turn end owned upstream")
+			return
+		}
+		noSpeechTimer = time.NewTimer(timeout)
 		noSpeechTimerC = noSpeechTimer.C
 	}
+	// noSpeechArmedEpoch is the grant epoch the deadline was last armed for
+	// (or deliberately left unarmed for, when configured off), so the arm
+	// decision runs once per grant rather than on every 80ms frame.
+	var noSpeechArmedEpoch uint64
 	resetTurnState := func() {
 		stopNoSpeechTimer()
 		buf = buf[:0]
@@ -930,10 +1031,40 @@ func (d *DataClient) streamMic(conn *websocket.Conn, stopCh <-chan struct{}, loc
 		return true
 	}
 
+	// Stall watchdog. On the AFE path the mic is an IPC fan-out from the
+	// helper's OpenSL recorder (internal/bindings/mic/afe_microphone.go):
+	// if that recorder stops delivering — helper read loop exited, AFE
+	// pipeline went quiet after a codec mute/unmute, AudioFlinger session
+	// stolen — this goroutine simply blocks on ch forever with micActive
+	// still true, and from outside it is indistinguishable from a quiet
+	// room. Wake detection dying silently after a mute/unmute is exactly
+	// the class of failure this is meant to make legible on the device:
+	// the watchdog says WHICH layer stopped (frames never reached
+	// streamMic) rather than leaving the scorer's zero counters to be
+	// read as "nobody spoke".
+	stall := time.NewTicker(micStallWarn)
+	defer stall.Stop()
+	lastFrame := time.Now()
+	stalled := false
+
 	for {
 		select {
 		case <-stopCh:
 			return
+
+		case <-stall.C:
+			since := time.Since(lastFrame)
+			if since < micStallWarn {
+				continue
+			}
+			if !stalled {
+				stalled = true
+				d.wakeMu.Lock()
+				granted := d.wakeGranted
+				d.wakeMu.Unlock()
+				log.Printf("[data] streamMic: no mic frames for %s — AFE recorder stalled? (granted=%v, muted=%v)",
+					since.Round(time.Second), granted, d.muted.Load())
+			}
 
 		case <-noSpeechTimerC:
 			// Safety timeout: if granted turn runs without upstream termination.
@@ -958,6 +1089,11 @@ func (d *DataClient) streamMic(conn *websocket.Conn, stopCh <-chan struct{}, loc
 			if !ok {
 				return
 			}
+			if stalled {
+				stalled = false
+				log.Printf("[data] streamMic: mic frames resumed after %s", time.Since(lastFrame).Round(time.Second))
+			}
+			lastFrame = time.Now()
 			// Stop has priority: select picks randomly among ready cases,
 			// so without this a closed stopCh racing a ready mic channel
 			// keeps this goroutine draining periods alongside its
@@ -1018,7 +1154,8 @@ func (d *DataClient) streamMic(conn *websocket.Conn, stopCh <-chan struct{}, loc
 			// deadline whose premise ("nobody spoke") is disproven. A new
 			// grant bumps the epoch and re-arms, since the new turn has no
 			// speech evidence of its own yet.
-			if noSpeechTimer == nil && !d.noSpeechDisarmedFor(epoch) {
+			if noSpeechArmedEpoch != epoch && !d.noSpeechDisarmedFor(epoch) {
+				noSpeechArmedEpoch = epoch
 				armNoSpeechTimer()
 			}
 

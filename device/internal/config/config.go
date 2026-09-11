@@ -10,6 +10,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"time"
 )
 
 // Device holds all runtime-tunable parameters for this device.
@@ -68,6 +69,22 @@ type Device struct {
 	SaveStopCaptures  bool
 	StopCaptureSec    float64
 	StopNearMissFloor float64
+
+	// NoSpeechTimeoutMs bounds how long a granted turn may run before the
+	// device ends it with frameTypeNoSpeechTimeout, unless the controller
+	// has sent "no_speech_disarm" first. Controller-tunable because STT
+	// providers differ wildly in how late they report the first
+	// transcript: Whisper-style batch providers and Pipecat's Gemini Live
+	// bridge only return a final after 6-8s, and every turn under the old
+	// fixed 5s died as no_speech. 0 disables the device-side timer
+	// entirely (end-of-turn is then owned upstream).
+	NoSpeechTimeoutMs int
+	// WakeReplayFrames is how many 80ms detector frames BEFORE the wake
+	// activation frame are replayed to the controller when a wake turn is
+	// granted. 25 (2s) reproduces the historical preroll; 0 replays only
+	// from the activation frame onward, which keeps the wake phrase itself
+	// out of the transcript for STT providers that transcribe literally.
+	WakeReplayFrames int
 
 	// AfeMicGainDb is a fixed digital gain applied to Amazon AFE's already
 	// processed S16 capture before it is sent to the controller. 0 = unity.
@@ -128,6 +145,8 @@ func (d *Device) loadDefaults() {
 	d.SaveStopCaptures = envBool("SAVE_STOP_CAPTURES", false)
 	d.StopCaptureSec = clampFloat(envFloat("STOP_CAPTURE_SEC", 2.0), 0.08, 5.0)
 	d.StopNearMissFloor = clampFloat(envFloat("STOP_NEAR_MISS_FLOOR", 0.05), 0, 1)
+	d.NoSpeechTimeoutMs = clampNoSpeechTimeoutMs(envInt("NO_SPEECH_TIMEOUT_MS", DefaultNoSpeechTimeoutMs))
+	d.WakeReplayFrames = clampWakeReplayFrames(envInt("WAKE_REPLAY_FRAMES", DefaultWakeReplayFrames))
 	d.BargeInThreshold = envFloat("BARGE_IN_THRESHOLD", 0.05)
 	d.DuckDb = envFloat("DUCK_DB", -18)
 	d.AfeMicGainDb = clampAfeMicGainDb(envInt("AFE_MIC_GAIN_DB", 0))
@@ -162,8 +181,14 @@ func (d *Device) Apply(msg ConfigMessage) {
 	if msg.OwwModel != "" {
 		d.OwwModel = msg.OwwModel
 	}
-	if msg.StopModel != "" {
-		d.StopModel = msg.StopModel
+	// Pointer-typed on the wire so the controller can CLEAR a previously
+	// pushed stop model: an explicit "stopModel": "" means "no stop
+	// classifier", while an absent key leaves the current value alone. The
+	// old non-empty-only rule made the empty string unreachable, so a
+	// device with no stop model installed kept trying to open the combined
+	// wake+stop scorer and reported the wake detector unavailable.
+	if msg.StopModel != nil {
+		d.StopModel = *msg.StopModel
 	}
 	if msg.StopThreshold > 0 {
 		d.StopThreshold = msg.StopThreshold
@@ -185,6 +210,14 @@ func (d *Device) Apply(msg ConfigMessage) {
 	}
 	if msg.StopNearMissFloor != nil {
 		d.StopNearMissFloor = clampFloat(*msg.StopNearMissFloor, 0, 1)
+	}
+	// Both pointer-typed: 0 is a legitimate value for each (timer off /
+	// no pre-activation replay) and must be distinguishable from absent.
+	if msg.NoSpeechTimeoutMs != nil {
+		d.NoSpeechTimeoutMs = clampNoSpeechTimeoutMs(*msg.NoSpeechTimeoutMs)
+	}
+	if msg.WakeReplayFrames != nil {
+		d.WakeReplayFrames = clampWakeReplayFrames(*msg.WakeReplayFrames)
 	}
 	if msg.BargeInEnabled != nil {
 		d.BargeInEnabled = *msg.BargeInEnabled
@@ -260,6 +293,9 @@ func (d *Device) Snapshot() ConfigMessage {
 	wakeNearMissFloor := d.WakeNearMissFloor
 	saveStopCaptures := d.SaveStopCaptures
 	stopNearMissFloor := d.StopNearMissFloor
+	stopModel := d.StopModel
+	noSpeechTimeoutMs := d.NoSpeechTimeoutMs
+	wakeReplayFrames := d.WakeReplayFrames
 	afeMicGainDb := d.AfeMicGainDb
 	bleProxyEnabled := false
 	if d.BleProxyEnabled != nil {
@@ -271,7 +307,7 @@ func (d *Device) Snapshot() ConfigMessage {
 		VadSilenceMs:      d.VadSilenceMs,
 		OwwThreshold:      d.OwwThreshold,
 		OwwModel:          d.OwwModel,
-		StopModel:         d.StopModel,
+		StopModel:         &stopModel,
 		StopThreshold:     d.StopThreshold,
 		SaveWakeCaptures:  &saveWakeCaptures,
 		WakeCaptureSec:    d.WakeCaptureSec,
@@ -279,6 +315,8 @@ func (d *Device) Snapshot() ConfigMessage {
 		SaveStopCaptures:  &saveStopCaptures,
 		StopCaptureSec:    d.StopCaptureSec,
 		StopNearMissFloor: &stopNearMissFloor,
+		NoSpeechTimeoutMs: &noSpeechTimeoutMs,
+		WakeReplayFrames:  &wakeReplayFrames,
 		BargeInEnabled:    &bargeInEnabled,
 		BargeInThreshold:  d.BargeInThreshold,
 		StartupVolume:     d.StartupVolume,
@@ -319,7 +357,7 @@ type ConfigMessage struct {
 	VadSilenceMs      int       `json:"vadSilenceMs,omitempty"`
 	OwwThreshold      float64   `json:"owwThreshold,omitempty"`
 	OwwModel          string    `json:"owwModel,omitempty"`
-	StopModel         string    `json:"stopModel,omitempty"`
+	StopModel         *string   `json:"stopModel,omitempty"`
 	StopThreshold     float64   `json:"stopThreshold,omitempty"`
 	SaveWakeCaptures  *bool     `json:"saveWakeCaptures,omitempty"`
 	WakeCaptureSec    float64   `json:"wakeCaptureSec,omitempty"`
@@ -327,6 +365,8 @@ type ConfigMessage struct {
 	SaveStopCaptures  *bool     `json:"saveStopCaptures,omitempty"`
 	StopCaptureSec    float64   `json:"stopCaptureSec,omitempty"`
 	StopNearMissFloor *float64  `json:"stopNearMissFloor,omitempty"`
+	NoSpeechTimeoutMs *int      `json:"noSpeechTimeoutMs,omitempty"`
+	WakeReplayFrames  *int      `json:"wakeReplayFrames,omitempty"`
 	BargeInEnabled    *bool     `json:"bargeInEnabled,omitempty"`
 	BargeInThreshold  float64   `json:"bargeInThreshold,omitempty"`
 	DuckDb            *float64  `json:"duckDb,omitempty"`
@@ -337,6 +377,68 @@ type ConfigMessage struct {
 	// Carried as raw JSON so this package does not depend on the
 	// animation renderer's types.
 	ListeningAnim json.RawMessage `json:"listeningAnim,omitempty"`
+}
+
+// StopModelName returns the configured stop model, or "" when none is
+// configured or the field is absent from the message.
+func (m ConfigMessage) StopModelName() string {
+	if m.StopModel == nil {
+		return ""
+	}
+	return *m.StopModel
+}
+
+// NoSpeechTimeout returns the effective no-speech deadline for a granted
+// turn; 0 means the device-side timer is disabled.
+func (m ConfigMessage) NoSpeechTimeout() time.Duration {
+	if m.NoSpeechTimeoutMs == nil {
+		return time.Duration(DefaultNoSpeechTimeoutMs) * time.Millisecond
+	}
+	return time.Duration(*m.NoSpeechTimeoutMs) * time.Millisecond
+}
+
+// WakeReplayFrameCount returns how many pre-activation detector frames a
+// wake grant replays (see Device.WakeReplayFrames).
+func (m ConfigMessage) WakeReplayFrameCount() int {
+	if m.WakeReplayFrames == nil {
+		return DefaultWakeReplayFrames
+	}
+	return *m.WakeReplayFrames
+}
+
+const (
+	// DefaultNoSpeechTimeoutMs preserves the historical fixed 5s deadline.
+	DefaultNoSpeechTimeoutMs = 5000
+	// MaxNoSpeechTimeoutMs bounds a misconfigured push: a turn that has
+	// heard nothing for two minutes is not waiting on a slow STT provider.
+	MaxNoSpeechTimeoutMs = 120000
+	// DefaultWakeReplayFrames is the historical 2s (25 x 80ms) preroll.
+	DefaultWakeReplayFrames = 25
+	// MaxWakeReplayFrames is bounded by the local detector ring, which
+	// holds 8s of frames (capture.DefaultFrames = 100) — anything larger
+	// could never be satisfied and would refuse every wake grant.
+	MaxWakeReplayFrames = 99
+)
+
+// clampNoSpeechTimeoutMs maps negatives to "disabled" and caps the top end.
+func clampNoSpeechTimeoutMs(ms int) int {
+	if ms < 0 {
+		return 0
+	}
+	if ms > MaxNoSpeechTimeoutMs {
+		return MaxNoSpeechTimeoutMs
+	}
+	return ms
+}
+
+func clampWakeReplayFrames(frames int) int {
+	if frames < 0 {
+		return 0
+	}
+	if frames > MaxWakeReplayFrames {
+		return MaxWakeReplayFrames
+	}
+	return frames
 }
 
 // clampAfeMicGainDb caps post-processor gain more tightly than direct mic

@@ -118,6 +118,7 @@ def _make_satellite(client=None, muted=False):
     entity._offer_lock = asyncio.Lock()
     entity._transcript_sent = False
     entity._endpoint_sent = False
+    entity._speech_start_sent = False
     entity._continue_conversation = False
     entity._tool_calls = {}
     entity._tool_call_sequence = 0
@@ -731,6 +732,56 @@ def test_stt_end_records_transcript_once_and_always_endpoints():
     assert len(transcript_calls) == 1
     assert transcript_calls[0][3] == {"text": "turn off the lights", "is_final": True}
     assert len(endpoint_calls) == 2
+
+
+def test_stt_vad_start_posts_speech_start_once_per_turn():
+    """HA's own VAD is the provider-independent speech evidence.
+
+    A slow STT provider (final transcript 6-8s after the utterance, no
+    partials) never reaches the transcript path before the device's
+    no-speech deadline; STT_VAD_START must reach the controller as
+    `speech-start` so it can disarm that deadline — and only once per turn.
+    """
+    entity, client, _coord = _make_satellite()
+    entity._active_turn_id = 1
+    entity._active_channel = object()
+    event = PipelineEvent(type=PipelineEventType.STT_VAD_START)
+
+    asyncio.run(entity._async_pipeline_event(event))
+    asyncio.run(entity._async_pipeline_event(event))  # duplicate event, same turn
+
+    assert [c[2] for c in client.calls] == ["speech-start"]
+    assert client.calls[0][1] == 1
+
+
+def test_stt_start_alone_is_not_speech_evidence():
+    """STT_START fires when STT begins, speech or not — relaying it would
+    defeat the device's no-speech deadline entirely."""
+    entity, client, _coord = _make_satellite()
+    entity._active_turn_id = 1
+    entity._active_channel = object()
+
+    asyncio.run(entity._async_pipeline_event(PipelineEvent(type=PipelineEventType.STT_START)))
+
+    assert client.calls == []
+
+
+def test_speech_start_guard_resets_for_the_next_turn():
+    """A continuation is a new turn with a new id: the guard must not carry
+    over, or the follow-up utterance would never disarm the re-armed
+    device deadline."""
+    entity, client, _coord = _make_satellite()
+    entity._active_turn_id = 1
+    entity._active_channel = object()
+    asyncio.run(entity._async_pipeline_event(PipelineEvent(type=PipelineEventType.STT_VAD_START)))
+
+    # What _handle_offer does when it accepts the next turn.
+    entity._active_turn_id = 2
+    entity._active_turn_token = object()
+    entity._speech_start_sent = False
+    asyncio.run(entity._async_pipeline_event(PipelineEvent(type=PipelineEventType.STT_VAD_START)))
+
+    assert [(c[1], c[2]) for c in client.calls] == [(1, "speech-start"), (2, "speech-start")]
 
 
 def test_stt_end_with_no_text_skips_transcript_but_still_endpoints():

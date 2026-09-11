@@ -104,6 +104,7 @@ select = _module("homeassistant.components.select")
 select.SelectEntity = SelectEntity
 pipeline = _module("homeassistant.components.assist_pipeline")
 pipeline.PipelineEventType = _enum("PipelineEventType", {
+    "STT_START": "stt_start", "STT_VAD_START": "stt_vad_start", "STT_VAD_END": "stt_vad_end",
     "STT_END": "stt_end", "INTENT_START": "intent_start", "INTENT_PROGRESS": "intent_progress",
     "INTENT_END": "intent_end", "TTS_END": "tts_end", "ERROR": "error",
 })

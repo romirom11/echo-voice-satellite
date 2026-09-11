@@ -129,7 +129,7 @@ def test_wake_request_admission_gate_allows_fresh_request():
     assert em_controller._wake_request_admission_gate(device) is None
 
 
-def test_stop_detected_cancels_turn_without_killing_the_handler(monkeypatch):
+def test_stop_detected_cancels_turn_without_killing_the_handler(monkeypatch, bundled_stop_model):
     """
     Regression test for a real, previously-shipped bug (5.3 in the
     device-only wake word design doc's hardware checklist): the accepted
@@ -1756,5 +1756,116 @@ def test_handle_control_rejects_non_register_and_holds_unknown_device_pending(mo
         await em_controller.handle_control(pending)
         assert pending.sent == [{"type": "pending"}]
         assert pending.closed
+
+    asyncio.run(run())
+
+
+def test_stop_word_off_is_pushed_as_an_explicit_empty_key_and_its_status_is_not_a_fault(
+        monkeypatch, caplog):
+    """
+    Optional stop word, end to end over the control plane: an effective
+    config with stopModel "" must reach the device as an explicitly present
+    empty key (that is how the device clears an installed model — dropping
+    empty values would silently keep the old one), the device's "no model /
+    not ready" stop_status is then the expected state rather than a warning,
+    and the admission gate passes without a ready model.
+    """
+    import logging
+
+    async def no_op(*args, **kwargs):
+        return None
+
+    class WS:
+        remote_address = ("192.0.2.14", 8767)
+
+        def __init__(self, device):
+            self.sent = []
+            self.closed = False
+            self._device = device
+            self._messages = self._stream()
+
+        def _stream(self):
+            yield json.dumps({
+                "type": "register", "device_id": self._device.device_id,
+                "ip": "192.0.2.14", "version": "test",
+                "capabilities": ["wake_request_v1", "stopword"],
+            })
+            yield json.dumps({
+                "type": "stop_status", "model": "", "ready": False,
+                "error": "disabled",
+            })
+            live = em_controller._devices.get(self._device.device_id)
+            assert live is not None
+            seen.append((live.stop_model, live.stop_model_ready, live.stop_admissible))
+
+        async def recv(self):
+            return next(self._messages)
+
+        async def send(self, value):
+            self.sent.append(json.loads(value))
+
+        async def close(self):
+            self.closed = True
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self._messages)
+            except StopIteration:
+                raise StopAsyncIteration
+
+    seen = []
+
+    async def run():
+        device = new_device(["wake_request_v1", "stopword"])
+        old_devices = em_controller._devices
+        em_controller._devices = {device.device_id: device}
+        monkeypatch.setattr(em_controller.db, "get_config", lambda *args: "strict")
+        monkeypatch.setattr(em_controller, "_link_auth_ok",
+                            lambda *args: asyncio.sleep(0, result=True))
+        monkeypatch.setattr(em_controller.db, "get_device",
+                            lambda *args: {"label": "Test", "approved": 1,
+                                           "firmware_ver": "v1"})
+        monkeypatch.setattr(em_controller.db, "get_turns", lambda *args: [])
+        monkeypatch.setattr(em_controller.db, "get_effective_device_config",
+                            lambda *args: {"stopModel": ""})
+        monkeypatch.setattr(em_controller.db, "get_device_config",
+                            lambda *args: {})
+        monkeypatch.setattr(em_controller.db, "set_device_config",
+                            lambda *args: None)
+        monkeypatch.setattr(em_controller.db, "record_device_stats",
+                            lambda *args: None)
+        monkeypatch.setattr(em_controller.db, "touch_device_seen",
+                            lambda *args: None)
+        monkeypatch.setattr(em_controller.db, "upsert_device_seen",
+                            lambda *args: None)
+        monkeypatch.setattr(em_controller.db, "log_device",
+                            lambda *args: None)
+        monkeypatch.setattr(em_controller.api, "_push_event", no_op)
+        monkeypatch.setattr(em_controller.api, "_push_log_event", no_op)
+        monkeypatch.setattr(em_controller.api, "notify_device_connected", no_op)
+        monkeypatch.setattr(em_controller.api, "notify_device_disconnected", no_op)
+        monkeypatch.setattr(em_controller.api, "reconcile_oww_assets", no_op)
+        monkeypatch.setattr(em_controller.em_player, "device_gone",
+                            lambda *args: None)
+        monkeypatch.setattr(em_controller, "leds_off", no_op)
+        monkeypatch.setattr(em_controller, "_push_device_state", no_op)
+        monkeypatch.setattr(em_controller.ha_sidechannels, "capabilities",
+                            lambda *args: None)
+        try:
+            ws = WS(device)
+            with caplog.at_level(logging.INFO, logger="echomuse"):
+                await em_controller.handle_control(ws)
+        finally:
+            em_controller._devices = old_devices
+
+        pushed = [m for m in ws.sent if m.get("type") == "config" and "stopModel" in m]
+        assert pushed, "config push must carry stopModel even when it is off"
+        assert pushed[0]["stopModel"] == ""
+        assert seen == [("", False, True)]
+        assert not any("stop word unavailable" in r.getMessage() for r in caplog.records)
+        assert any("stop word off" in r.getMessage() for r in caplog.records)
 
     asyncio.run(run())

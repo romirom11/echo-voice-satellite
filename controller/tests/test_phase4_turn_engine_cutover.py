@@ -621,3 +621,125 @@ def test_run_turn_waits_for_tts_after_a_downgraded_timeout(monkeypatch):
     result, played = asyncio.run(run())
     assert result is True
     assert played == [True]
+
+
+# ── speech-start: HA's VAD as provider-independent speech evidence ─────────
+
+class _ActionRequest:
+    def __init__(self, tid, action, body=None):
+        self.match_info = {"tid": str(tid)}
+        self.path = f"/api/turns/{tid}/{action}"
+        self._body = body or {}
+
+    async def json(self):
+        return self._body
+
+
+def test_speech_start_disarms_the_device_deadline_before_any_transcript():
+    """
+    The failure this closes: an STT provider that returns only a final
+    transcript 6-8s after the utterance (Pipecat's Gemini Live bridge)
+    never produced a partial before the device's 5s no-speech deadline, so
+    the transcript-triggered disarm came too late and every turn ended as
+    no_speech. HA's own VAD fires STT_VAD_START within a few hundred ms of
+    speech regardless of the provider; HACS relays it as `speech-start`.
+    """
+    async def run():
+        device = FakeDevice()
+        turn = engine.Turn(20, device, None, None)
+        engine.ENGINE.turns[20] = turn
+        try:
+            response = await engine.turn_action(_ActionRequest(20, "speech-start"))
+            assert response.status == 200
+            assert device.controls == [{"type": "no_speech_disarm"}]
+            assert turn.no_speech_disarmed is True
+            assert turn.speech_started is True
+            assert turn.speech_start_mono is not None
+            assert turn.stt_text is None  # no transcript needed for the disarm
+        finally:
+            engine.ENGINE.turns.pop(20, None)
+
+    asyncio.run(run())
+
+
+def test_speech_start_and_transcript_share_one_disarm_per_turn():
+    """Whichever evidence arrives first disarms; the other must not re-send.
+    Both orders are covered because either can win in practice."""
+    async def run():
+        device = FakeDevice()
+        turn = engine.Turn(21, device, None, None)
+        engine.ENGINE.turns[21] = turn
+        try:
+            await engine.turn_action(_ActionRequest(21, "speech-start"))
+            await engine.turn_action(_ActionRequest(21, "speech-start"))
+            await engine.turn_action(_TranscriptRequest(21, {"text": "set a timer"}))
+            assert device.controls == [{"type": "no_speech_disarm"}]
+            assert turn.stt_text == "set a timer"
+        finally:
+            engine.ENGINE.turns.pop(21, None)
+
+        device = FakeDevice()
+        turn = engine.Turn(22, device, None, None)
+        engine.ENGINE.turns[22] = turn
+        try:
+            await engine.turn_action(_TranscriptRequest(22, {"text": "hey", "is_final": False}))
+            await engine.turn_action(_ActionRequest(22, "speech-start"))
+            assert device.controls == [{"type": "no_speech_disarm"}]
+            assert turn.speech_started is True
+        finally:
+            engine.ENGINE.turns.pop(22, None)
+
+    asyncio.run(run())
+
+
+def test_speech_start_for_an_unknown_turn_is_404_not_a_crash():
+    async def run():
+        engine.ENGINE.turns.pop(23, None)
+        response = await engine.turn_action(_ActionRequest(23, "speech-start"))
+        assert response.status == 404
+
+    asyncio.run(run())
+
+
+def test_speech_start_reaches_the_continuation_turn_not_the_original():
+    """
+    A continuation is a NEW Turn with a new id (trigger_voice_turn creates
+    one per pipeline run, after em_controller re-arms the device's timer
+    with mic_start). HACS posts the action against the id in the new
+    wake.offer, so the disarm goes out for the new grant even though the
+    original turn already disarmed once.
+    """
+    async def run():
+        device = FakeDevice()
+        first = engine.Turn(24, device, None, None)
+        engine.ENGINE.turns[24] = first
+        cont = engine.Turn(25, device, None, None)
+        engine.ENGINE.turns[25] = cont
+        try:
+            await engine.turn_action(_ActionRequest(24, "speech-start"))
+            await engine.turn_action(_ActionRequest(25, "speech-start"))
+            assert device.controls == [{"type": "no_speech_disarm"}] * 2
+            assert first.no_speech_disarmed and cont.no_speech_disarmed
+        finally:
+            engine.ENGINE.turns.pop(24, None)
+            engine.ENGINE.turns.pop(25, None)
+
+    asyncio.run(run())
+
+
+def test_no_speech_timeout_after_speech_start_is_treated_as_normal_end():
+    """Old firmware that ignores no_speech_disarm still sends the timeout
+    sentinel; with HA's VAD already reporting speech that is a lost race,
+    not a silent room — wait for HA's answer instead of skipping it."""
+    async def run():
+        device = FakeDevice()
+        turn = engine.Turn(26, device, None, None)
+        turn.socket = FakeSocket()
+        turn.speech_started = True
+        await device.voice_queue.put(engine.VAD_SENTINEL_TIMEOUT)
+        await engine._send_mic(turn)
+        assert turn.no_speech is False
+        assert turn.endpoint.is_set()
+        assert [frame.frame_type for frame in turn.socket.frames] == [2]  # MIC_EOS
+
+    asyncio.run(run())

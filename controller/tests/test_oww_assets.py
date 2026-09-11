@@ -341,3 +341,58 @@ def test_two_selected_models_leave_two_rollback_slots():
     assert A.missing_required_classifiers(desired, actual) == []
     del actual["stop.onnx"]
     assert A.missing_required_classifiers(desired, actual) == ["stop.onnx"]
+
+
+# ── Optional stop word ─────────────────────────────────────────────────────
+
+def test_effective_stop_model_empty_is_off():
+    assert A.effective_stop_model("") == ""
+    assert A.effective_stop_model(None) == ""
+    assert A.effective_stop_model("   ") == ""
+
+
+def test_effective_stop_model_builtin_without_a_classifier_resolves_to_off(tmp_path, monkeypatch):
+    """A controller built without the maintainer's private stop.onnx (and
+    with nothing uploaded) must not leave every turn refused as 'stop word
+    unavailable' — the default 'stop' resolves to off."""
+    import em_oww_models
+    monkeypatch.setattr(em_oww_models, "BUILTIN_STOP_PATH", tmp_path / "absent" / "stop.onnx")
+    assert A.effective_stop_model("stop", models_dir=tmp_path) == ""
+
+
+def test_effective_stop_model_builtin_with_bundled_classifier_is_unchanged(tmp_path, monkeypatch):
+    """The maintainer's setup: the image bundles the model, nothing changes."""
+    import em_oww_models
+    bundled = tmp_path / "stop.onnx"
+    bundled.write_bytes(b"onnx")
+    monkeypatch.setattr(em_oww_models, "BUILTIN_STOP_PATH", bundled)
+    assert A.effective_stop_model("stop", models_dir=tmp_path / "models") == "stop"
+
+
+def test_effective_stop_model_builtin_with_uploaded_classifier_is_unchanged(tmp_path, monkeypatch):
+    """An admin-supplied stop.onnx beside the database is equally authoritative."""
+    import em_oww_models
+    monkeypatch.setattr(em_oww_models, "BUILTIN_STOP_PATH", tmp_path / "absent" / "stop.onnx")
+    models_dir = tmp_path / "models"
+    models_dir.mkdir()
+    (models_dir / "stop.onnx").write_bytes(b"onnx")
+    assert A.effective_stop_model("stop", models_dir=models_dir) == "stop"
+
+
+def test_effective_stop_model_custom_path_is_left_alone(tmp_path):
+    """A missing custom path is a reported error (asset reconcile, dashboard),
+    not silently 'off'."""
+    custom = str(tmp_path / "my_stop.onnx")
+    assert A.effective_stop_model(custom, models_dir=tmp_path) == custom
+
+
+def test_desired_assets_with_the_stop_word_off_plans_without_a_stop_problem(tmp_path, monkeypatch):
+    """Planning must not fail or report a missing stop classifier when the
+    stop word is off — an empty model name is simply not wanted."""
+    import em_oww_models
+    monkeypatch.setattr(em_oww_models, "BUILTIN_STOP_PATH", tmp_path / "absent" / "stop.onnx")
+    models = [m for m in ("hey_jarvis_v0.1", A.effective_stop_model("stop", models_dir=tmp_path)) if m]
+    assets, problems = A.desired_assets(
+        models, runtime_dir=tmp_path, resources=None, models_dir=tmp_path, include_stock=False,
+    )
+    assert not any("stop" in p for p in problems)

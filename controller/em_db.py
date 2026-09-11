@@ -107,8 +107,30 @@ DEFAULT_DEVICE_CONFIG = {
     # room, like the LED meter curve, not a firmware push per attempt.
     "duckDb": -18.0,
     "owwModel":         "hey_jarvis_v0.1",
-    # Mandatory local interruption model. The fixed image asset is seeded as
-    # the fleet default; this remains overrideable per Wake word section.
+    # noSpeechTimeoutMs: how long the device waits for speech after a turn
+    # is granted (wake, button or continuation) before ending it on its own
+    # as no_speech. The controller disarms this deadline as soon as HA
+    # reports speech (its VAD via the `speech-start` turn action, or a
+    # transcript), so it only ever fires on a genuinely silent room — or on
+    # a pipeline whose STT gives HA nothing to relay in time. 0 disables the
+    # device-side deadline entirely (the controller's ENDPOINT_WAIT_TIMEOUT_S
+    # still bounds the turn).
+    "noSpeechTimeoutMs": 5000,
+    # wakeReplayFrames: how many buffered mic frames from before the wake
+    # activation the device replays at the start of the turn stream, so the
+    # words spoken in the same breath as the wake word are not clipped. The
+    # replay includes the tail of the wake phrase itself, which a literal STT
+    # provider transcribes ("hey jarvis turn on the light"); 0 replays
+    # nothing and keeps the wake phrase out of the transcript, at the cost of
+    # clipping a fast talker's first word.
+    "wakeReplayFrames": 25,
+    # Local interruption model. The fixed image asset is seeded as the fleet
+    # default; this remains overrideable per Stop word section. The stop
+    # word is OPTIONAL: an empty value turns it off, and so does this default
+    # when no stop classifier is available to the controller (the image was
+    # built without /app/models/stopword/stop.onnx and nothing was uploaded)
+    # — see em_oww_assets.effective_stop_model. With the model present the
+    # behaviour is unchanged: stop is armed for every response.
     "stopModel":        "stop",
     # Conservative until real post-AFE field captures establish the calibrated
     # value. One threshold applies to thinking and playback by design.
