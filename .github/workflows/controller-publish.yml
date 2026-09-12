@@ -20,6 +20,14 @@ on:
     tags: ['controller-v*']
   workflow_dispatch:
 
+# A tag push and the main push it sits on trigger two builds of the same
+# commit. Their images are byte-identical, and pushing the same layers to
+# GHCR from two runners at once has failed with "error writing layer blob:
+# not_found" (controller-v2.21.1). Serialise them instead.
+concurrency:
+  group: controller-publish
+  cancel-in-progress: false
+
 permissions:
   contents: read
   packages: write
