@@ -133,6 +133,11 @@ INGRESS_GATEWAY_IP = "172.30.32.2"
 # tags, GHCR image only). /releases/latest returns whichever was published
 # most recently — _fetch_latest_release filters the list for the newest
 # release that is actually a device firmware release.
+# Repository whose GitHub Releases (v* + `server` asset) and controller-v*
+# tags the update checks read. The DB key `github_repo` (Settings) overrides
+# it; the EM_GITHUB_REPO env var seeds the default for a deployment that
+# tracks a fork.
+DEFAULT_GITHUB_REPO = os.environ.get("EM_GITHUB_REPO", "romirom11/echo-voice-satellite")
 GITHUB_API_URL = "https://api.github.com/repos/{repo}/releases?per_page=10"
 
 # How long to cache GitHub release info in memory (seconds).
@@ -4197,7 +4202,7 @@ async def _fetch_latest_release(force: bool = False) -> Optional[dict]:
     """
     global _release_cache, _release_cache_ts
 
-    repo = db.get_config("github_repo", "amitra93/echo-voice-satellite")
+    repo = db.get_config("github_repo", DEFAULT_GITHUB_REPO)
     url  = GITHUB_API_URL.format(repo=repo)
 
     log.info(f"[api] Polling GitHub releases: {url}")
@@ -4311,7 +4316,7 @@ async def _fetch_controller_release(force: bool = False) -> Optional[dict]:
             and (time.monotonic() - _controller_cache_ts) < RELEASE_CACHE_TTL):
         return _controller_cache
 
-    repo = db.get_config("github_repo", "amitra93/echo-voice-satellite")
+    repo = db.get_config("github_repo", DEFAULT_GITHUB_REPO)
     headers = {"Accept": "application/vnd.github+json"}
     timeout = aiohttp.ClientTimeout(total=10)
 

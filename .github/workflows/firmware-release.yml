@@ -1,0 +1,80 @@
+# Cut a device firmware release from a `v*` tag.
+#
+# The controller's update check reads this repository's GitHub Releases and
+# takes the newest `v*` release that carries a `server` asset (see
+# controller/em_api.py `_fetch_latest_release`). The dashboard then offers
+# it as an OTA update and installs it into the inactive A/B slot.
+#
+# The version embedded in the binary is the tag itself (compile.sh does the
+# same with `git describe --match 'v*'` for local builds), so the device
+# reports e.g. `v2.21.0` on connect and the dashboard can compare it with
+# the release it fetched.
+#
+#   git tag -a v2.21.0 -m "release notes…"   # the annotation becomes the notes
+#   git push origin v2.21.0
+name: Firmware Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build firmware and publish the release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: true
+          fetch-depth: 0
+
+      - name: Build compiler image
+        run: docker build -t echomuse-compiler device/compiler/
+
+      - name: Build firmware
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          docker run --rm --entrypoint bash \
+            -e CGO_LDFLAGS="-Wl,--hash-style=both" \
+            -e CGO_CFLAGS="-Wno-deprecated-declarations -Wno-null-dereference" \
+            -v "$PWD/device":/sdk \
+            -v "$PWD/GoTinyAlsa":/GoTinyAlsa \
+            echomuse-compiler \
+            -c "cd /sdk && mkdir -p build && go build \
+              -tags server \
+              -ldflags \"-X github.com/wilbowes/EchoMuse/internal/client.Version=${VERSION} \
+                         -X github.com/wilbowes/EchoMuse/internal/client.BuildUnix=$(date +%s)\" \
+              -o build/server \
+              ./cmd/"
+
+      - name: Check it is an ARM binary
+        run: |
+          file device/build/server
+          file device/build/server | grep -q "ARM" || {
+            echo "::error::firmware is not an ARM binary"; exit 1; }
+          (cd device/build && sha256sum server > server.sha256)
+          cat device/build/server.sha256
+
+      - name: Release notes from the tag annotation
+        env:
+          TAG: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          git tag -l --format='%(contents)' "$TAG" > notes.md
+          if [ ! -s notes.md ]; then echo "Firmware $TAG" > notes.md; fi
+          echo "" >> notes.md
+          echo "Built from $SHA by the Firmware Release workflow." >> notes.md
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" \
+            --title "Firmware $TAG" \
+            --notes-file notes.md \
+            device/build/server device/build/server.sha256

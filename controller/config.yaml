@@ -8,7 +8,7 @@ name: "EchoMuse"
 # `:sha-<short>` tags now. Nothing currently publishes a `:2.20.1` image, so
 # Supervisor will fail to pull this add-on until that gap is resolved (revive
 # a promotion step, or point this field at a sha tag some other way).
-version: "2.20.1"
+version: "2.21.0"
 # Pull the published multi-arch image rather than building on the user's
 # machine. Without this Supervisor builds from this directory's Dockerfile,
 # which downloads a few hundred MB on whatever the user runs Home Assistant
@@ -24,10 +24,10 @@ version: "2.20.1"
 # add-on changes before they reach main (Supervisor clones the default
 # branch), and "it compiles onnxruntime" made that loop look far more
 # expensive than it is. tools/make_dev_addon.sh packages one.
-image: "ghcr.io/amitra93/echomuse-controller"
+image: "ghcr.io/romirom11/echomuse-controller"
 slug: "controller"
 description: "Local, open-source voice assistant controller for rooted Echo Dot 2nd Gen devices — wake word, fleet dashboard, and a native Home Assistant (HACS) voice-satellite integration."
-url: "https://github.com/amitra93/echo-voice-satellite"
+url: "https://github.com/romirom11/echo-voice-satellite"
 init: false
 arch:
   - aarch64
