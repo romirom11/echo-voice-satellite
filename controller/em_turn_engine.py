@@ -905,15 +905,46 @@ def _end_turn(turn: Turn, reason: str, *, cancel: bool = True) -> None:
     if cancel:
         turn.cancelled.set()
         turn.tts_queue.put_nowait(None)
+        # _run_turn blocks on `endpoint` for the whole listening phase and
+        # only looks at `cancelled` once it is set. A cancel that lands while
+        # HA is still transcribing (mute, the dot button) must not wait for
+        # HA's endpoint: with a backend that reports STT only after the whole
+        # model turn (Pipecat) that is tens of seconds during which the
+        # device's voice_lock stays held, so every wake request is routed to
+        # admit_barge, which finds no live turn and denies it — the device
+        # looks deaf after unmute.
+        turn.endpoint.set()
 
 
 def cancel_voice_turn(
     device_id: str, abort_ha: bool = False, reason: str = "cancelled"
-) -> None:
+) -> list[int]:
+    """End every turn of a device locally; returns the ids that were ended."""
     del abort_ha
+    ended: list[int] = []
     for turn in ENGINE.turns.values():
         if turn.device.device_id == device_id:
             _end_turn(turn, reason)
+            ended.append(turn.turn_id)
+    return ended
+
+
+async def abort_voice_turns(device_id: str, reason: str) -> list[int]:
+    """Cancel a device's turns AND tell their HACS owner to abort Assist.
+
+    cancel_voice_turn only unblocks the controller's side; the integration
+    keeps its pipeline running (STT, the model turn, TTS synthesis) until it
+    fails to reach the closed audio socket. stop_voice_turn already avoids
+    that for the stop word with a turn.cancel event — a mute or a button
+    cancel is the same request from a different input.
+    """
+    ended = cancel_voice_turn(device_id, reason=reason) or []
+    for turn_id in ended:
+        await _push_event({
+            "type": "turn.cancel", "device_id": device_id,
+            "turn_id": turn_id, "reason": reason,
+        })
+    return ended
 
 
 def confirm_device_started(device, request_id: str, turn_id: int) -> bool:

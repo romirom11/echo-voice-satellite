@@ -32,7 +32,7 @@ def test_control_dispatch_survives_a_handler_exception():
     # The HACS cutover keeps the per-message dispatch in this handler, rather
     # than sending it through a deleted ESPHome satellite. Registration stays
     # outside the dispatch loop because an unknown initial state is fatal.
-    assert "turn_engine.cancel_voice_turn" in guard
+    assert "turn_engine.abort_voice_turns" in guard
     assert "ha_sidechannels" in guard
 
 

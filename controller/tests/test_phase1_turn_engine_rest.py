@@ -598,3 +598,36 @@ def test_cancel_voice_turn_preserves_the_requested_cause(fresh_engine):
 
     assert turn.cancelled.is_set()
     assert turn.end_reason == "muted"
+
+
+def test_cancel_unblocks_a_turn_still_waiting_for_the_endpoint(fresh_engine):
+    # Mute/button during listening: _run_turn waits on `endpoint` and must
+    # not keep the voice_lock until HA's STT eventually ends (tens of
+    # seconds with a backend that endpoints after the whole model turn).
+    device = FakeDevice()
+    turn = engine.Turn(1, device, None, None)
+    engine.ENGINE.turns = {1: turn}
+
+    engine.cancel_voice_turn("device-1", reason="muted")
+
+    assert turn.endpoint.is_set()
+    assert turn.cancelled.is_set()
+
+
+def test_abort_voice_turns_tells_the_hacs_owner(fresh_engine):
+    events = fresh_engine
+    device = FakeDevice()
+    other = FakeDevice("device-2")
+    engine.ENGINE.turns = {
+        7: engine.Turn(7, device, None, None),
+        8: engine.Turn(8, other, None, None),
+    }
+
+    ended = asyncio.run(engine.abort_voice_turns("device-1", reason="muted"))
+
+    assert ended == [7]
+    assert events == [
+        {"type": "turn.cancel", "device_id": "device-1", "turn_id": 7, "reason": "muted"},
+    ]
+    assert engine.ENGINE.turns[7].end_reason == "muted"
+    assert not engine.ENGINE.turns[8].cancelled.is_set()

@@ -8,7 +8,7 @@ name: "EchoMuse"
 # `:sha-<short>` tags now. Nothing currently publishes a `:2.20.1` image, so
 # Supervisor will fail to pull this add-on until that gap is resolved (revive
 # a promotion step, or point this field at a sha tag some other way).
-version: "2.21.0"
+version: "2.21.1"
 # Pull the published multi-arch image rather than building on the user's
 # machine. Without this Supervisor builds from this directory's Dockerfile,
 # which downloads a few hundred MB on whatever the user runs Home Assistant

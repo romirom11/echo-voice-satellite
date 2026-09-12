@@ -1762,7 +1762,7 @@ async def handle_button_event(device: Device, event: dict):
             await deny_button("cancelled")
             log.info(f"[{device.device_id}] Dot button — cancelling voice turn")
             device.cancel_event.set()
-            turn_engine.cancel_voice_turn(device.device_id, reason="cancelled")
+            await turn_engine.abort_voice_turns(device.device_id, reason="cancelled")
             # Flush the device's speaker too, or cancelling DURING the spoken
             # response only stops the controller feeding it: the ring clears
             # while up to ~5.5s already in audioChanDepth plays out, and the
@@ -2420,7 +2420,7 @@ async def handle_control(ws: WebSocketServerProtocol, secure: bool = False):
                             f"cancelling"
                         )
                         device.cancel_event.set()
-                        turn_engine.cancel_voice_turn(device_id, reason="muted")
+                        await turn_engine.abort_voice_turns(device_id, reason="muted")
                         await device.send_control({"type": "speaker_flush"})
                     await api._push_event({
                         "type":      "device_update",
