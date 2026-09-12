@@ -56,8 +56,10 @@ jobs:
           file device/build/server
           file device/build/server | grep -q "ARM" || {
             echo "::error::firmware is not an ARM binary"; exit 1; }
-          (cd device/build && sha256sum server > server.sha256)
-          cat device/build/server.sha256
+          # device/build is created by the compiler container (root-owned),
+          # so write the checksum next to the workspace instead.
+          sha256sum device/build/server | sed 's# .*# server#' > server.sha256
+          cat server.sha256
 
       - name: Release notes from the tag annotation
         env:
@@ -77,4 +79,4 @@ jobs:
           gh release create "$TAG" \
             --title "Firmware $TAG" \
             --notes-file notes.md \
-            device/build/server device/build/server.sha256
+            device/build/server server.sha256
