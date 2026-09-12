@@ -454,3 +454,39 @@ func TestNoSpeechTimeoutAndWakeReplayFramesConfig(t *testing.T) {
 		t.Fatal("nil-field accessors must return the defaults")
 	}
 }
+
+// TestOwwPatienceFramesConfig: the default keeps the single-frame trigger,
+// a push sets it, an absent key leaves it alone, and the value is clamped
+// to [1, MaxOwwPatienceFrames].
+func TestOwwPatienceFramesConfig(t *testing.T) {
+	d := &Device{}
+	d.mu.Lock()
+	d.loadDefaults()
+	d.mu.Unlock()
+	if d.OwwPatienceFrames != DefaultOwwPatienceFrames || d.Snapshot().OwwPatienceFrames != 1 {
+		t.Fatalf("default = %d, want %d", d.OwwPatienceFrames, DefaultOwwPatienceFrames)
+	}
+
+	var msg ConfigMessage
+	if err := json.Unmarshal([]byte(`{"type":"config","owwPatienceFrames":2}`), &msg); err != nil {
+		t.Fatal(err)
+	}
+	d.Apply(msg)
+	if d.OwwPatienceFrames != 2 || d.Snapshot().OwwPatienceFrames != 2 {
+		t.Fatalf("after push = %d, want 2", d.OwwPatienceFrames)
+	}
+
+	var partial ConfigMessage
+	if err := json.Unmarshal([]byte(`{"type":"config","owwThreshold":0.6}`), &partial); err != nil {
+		t.Fatal(err)
+	}
+	d.Apply(partial)
+	if d.OwwPatienceFrames != 2 {
+		t.Fatalf("partial push changed the value: %d", d.OwwPatienceFrames)
+	}
+
+	d.Apply(ConfigMessage{OwwPatienceFrames: 1000})
+	if d.OwwPatienceFrames != MaxOwwPatienceFrames {
+		t.Fatalf("clamp = %d, want %d", d.OwwPatienceFrames, MaxOwwPatienceFrames)
+	}
+}

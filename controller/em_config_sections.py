@@ -30,7 +30,7 @@ SECTIONS: dict[str, dict] = {
     "wakeword": {
         "label": "Wake word",
         "keys": [
-            "owwModel", "owwThreshold",
+            "owwModel", "owwThreshold", "owwPatienceFrames",
             "bargeInEnabled", "bargeInThreshold", "wakeArbitrationMs",
             "noSpeechTimeoutMs", "wakeReplayFrames",
             "saveWakeCaptures", "wakeCaptureSec",

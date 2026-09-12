@@ -102,6 +102,16 @@ type Scorer struct {
 	bargeThreshold float32
 	speakerActive  func() bool
 	refract        time.Duration
+	// patience is how many consecutive frames must score at or above the
+	// threshold before a crossing fires (openWakeWord's own "patience").
+	// 1 is the historical single-frame behaviour. A spoken wake word holds
+	// the score up for several 80ms frames; a one-frame spike out of
+	// ordinary conversation does not (0.21 → 0.64 → 0.46 → 0.15 fired a
+	// turn at threshold 0.50 on 2026-09-12), and patience 2 separates the
+	// two without raising the bar for the real thing.
+	patience int
+	// above counts the consecutive frames at or above the threshold so far.
+	above int
 	onCross        func(score, threshold float32, at time.Time, sequence uint16)
 	onScore        func(ScoreEvent)
 	head           []Head
@@ -201,6 +211,7 @@ func NewScorerWithHeads(inf wakeword.Inferer, threshold float32, onCross func(sc
 	s := &Scorer{
 		det:       wakeword.New(inf),
 		threshold: threshold,
+		patience:  1,
 		refract:   DefaultRefractory,
 		onCross:   onCross,
 		head:      heads,
@@ -217,6 +228,20 @@ func NewScorerWithHeads(inf wakeword.Inferer, threshold float32, onCross func(sc
 func (s *Scorer) SetThreshold(t float32) {
 	s.mu.Lock()
 	s.threshold = t
+	s.mu.Unlock()
+}
+
+// SetPatience sets how many consecutive frames must clear the threshold before
+// a crossing fires. Values below 1 read as 1 (every frame is its own run).
+func (s *Scorer) SetPatience(frames int) {
+	if frames < 1 {
+		frames = 1
+	}
+	s.mu.Lock()
+	s.patience = frames
+	if s.above > frames {
+		s.above = frames
+	}
 	s.mu.Unlock()
 }
 
@@ -391,6 +416,7 @@ func (s *Scorer) run() {
 			s.det.Reset()
 			s.mu.Lock()
 			s.ready = false
+			s.above = 0
 			s.mu.Unlock()
 		}
 
@@ -426,17 +452,26 @@ func (s *Scorer) run() {
 		if score > s.stats.MaxScore {
 			s.stats.MaxScore = score
 		}
-		crossed := score >= threshold && now.Sub(s.lastCross) >= s.refract
+		if score >= threshold {
+			s.above++
+		} else {
+			s.above = 0
+		}
+		crossed := s.above >= s.patience && now.Sub(s.lastCross) >= s.refract
 		if crossed {
 			s.stats.Crossings++
 			s.lastCross = now
+			// The run that fired is spent; the refractory period covers the
+			// rest of this utterance, and the next one starts a fresh count.
+			s.above = 0
 		}
+		run := s.above
 		onScore := s.onScore
 		bargeThreshold := s.bargeThreshold > 0 && threshold == s.bargeThreshold
 		s.mu.Unlock()
 
 		if score > 0.01 {
-			log.Printf("[wake] score=%.4f threshold=%.2f crossed=%v seq=%d barge=%v", score, threshold, crossed, frame.sequence, bargeThreshold)
+			log.Printf("[wake] score=%.4f threshold=%.2f crossed=%v run=%d seq=%d barge=%v", score, threshold, crossed, run, frame.sequence, bargeThreshold)
 		}
 		if onScore != nil {
 			onScore(ScoreEvent{

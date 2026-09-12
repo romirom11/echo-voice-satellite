@@ -834,3 +834,75 @@ func TestCloseDuringPushDoesNotPanic(t *testing.T) {
 		s.Close() // documented as safe to call twice
 	}
 }
+
+// TestPatienceRequiresConsecutiveFramesAboveThreshold: with patience 2 a
+// one-frame spike (the false activation seen on 2026-09-12: 0.21 → 0.64 →
+// 0.46 → 0.15 at threshold 0.50) fires nothing, while two consecutive
+// frames above the bar — what a spoken wake word produces — fire once.
+func TestPatienceRequiresConsecutiveFramesAboveThreshold(t *testing.T) {
+	var (
+		mu      sync.Mutex
+		crosses []float32
+	)
+	inf := &fakeInferer{}
+	s := NewScorer(inf, 0.5, func(score, _ float32, at time.Time, _ uint16) {
+		mu.Lock()
+		crosses = append(crosses, score)
+		mu.Unlock()
+	})
+	defer s.Close()
+	s.SetPatience(2)
+
+	inf.set(0.0, 0)
+	pushAll(t, s, wakeword.FeatWindow)
+	waitFor(t, "detector to become ready", func() bool { return s.Ready() })
+
+	// A single frame over the bar, then back under: no crossing.
+	inf.set(0.64, 0)
+	pushAll(t, s, 1)
+	inf.set(0.46, 0)
+	pushAll(t, s, 1)
+	inf.set(0.15, 0)
+	pushAll(t, s, 3)
+	time.Sleep(50 * time.Millisecond)
+	mu.Lock()
+	n := len(crosses)
+	mu.Unlock()
+	if n != 0 {
+		t.Fatalf("a one-frame spike fired %d crossing(s) with patience 2, want 0", n)
+	}
+
+	// Two consecutive frames over the bar: exactly one crossing, on the
+	// second frame.
+	inf.set(0.91, 0)
+	pushAll(t, s, 2)
+	waitFor(t, "a crossing to fire", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(crosses) >= 1
+	})
+	inf.set(0.96, 0)
+	pushAll(t, s, 3)
+	time.Sleep(50 * time.Millisecond)
+	mu.Lock()
+	n = len(crosses)
+	mu.Unlock()
+	if n != 1 {
+		t.Fatalf("got %d crossings for one sustained utterance with patience 2, want 1", n)
+	}
+	if st := s.Drain(); st.Crossings != 1 {
+		t.Errorf("stats recorded %d crossings, want 1", st.Crossings)
+	}
+}
+
+func TestSetPatienceBelowOneReadsAsOne(t *testing.T) {
+	s := NewScorer(&fakeInferer{}, 0.5, nil)
+	defer s.Close()
+	s.SetPatience(0)
+	s.mu.Lock()
+	got := s.patience
+	s.mu.Unlock()
+	if got != 1 {
+		t.Fatalf("patience after SetPatience(0) = %d, want 1", got)
+	}
+}

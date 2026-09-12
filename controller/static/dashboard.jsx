@@ -4994,7 +4994,7 @@ const STAGE_MONO = "'DM Mono',monospace";
 // be silently wrong.
 const CONFIG_SECTIONS = {
   "playback": ["eqBands", "eqLoudness", "ttsGainDb", "duckDb", "limiterEnabled", "limiterRelease", "bassGuardEnabled", "bassGuardDb"],
-  "wakeword": ["owwModel", "owwThreshold", "bargeInEnabled", "bargeInThreshold", "wakeArbitrationMs", "noSpeechTimeoutMs", "wakeReplayFrames", "saveWakeCaptures", "wakeCaptureSec", "wakeNearMissFloor"],
+  "wakeword": ["owwModel", "owwThreshold", "owwPatienceFrames", "bargeInEnabled", "bargeInThreshold", "wakeArbitrationMs", "noSpeechTimeoutMs", "wakeReplayFrames", "saveWakeCaptures", "wakeCaptureSec", "wakeNearMissFloor"],
   "stopword": ["stopModel", "stopThreshold", "saveStopCaptures", "stopCaptureSec", "stopNearMissFloor"],
   "microphones": ["afeMicGainDb", "saveUtterances"],
   "ring": ["ledScene", "ledListenColor", "ledThinkColor", "meterAttack", "meterDecay", "meterFloor", "meterGamma", "meterRef", "meterCurve"],
@@ -5411,6 +5411,7 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
               <Slider label="Arbitration window" sub="ms that the first Echo to hear you silences the others — no added delay; 0 disables" value={config.wakeArbitrationMs ?? 700} min={0} max={2000} step={50} unit="ms" onChange={v => set('wakeArbitrationMs', v)}/>
               <Slider label="No-speech timeout" sub="ms the Echo waits for you to speak after a wake, tap or follow-up before ending the turn on its own; disarmed as soon as Home Assistant hears speech, so raise it only if turns end before a slow STT engine reports anything. 0 = off" value={config.noSpeechTimeoutMs ?? 5000} min={0} max={15000} step={500} unit="ms" onChange={v => set('noSpeechTimeoutMs', v)}/>
               <Slider label="Wake replay" sub="mic frames (80ms each) from before the activation replayed into the turn so words spoken in the same breath as the wake word are kept — the tail of the wake phrase rides along and a literal STT engine will transcribe it. 0 = none: keeps the wake phrase out of the transcript, may clip a fast first word" value={config.wakeReplayFrames ?? 25} min={0} max={60} step={1} unit="fr" onChange={v => set('wakeReplayFrames', v)}/>
+              <Slider label="Wake patience" sub="consecutive frames (80ms each) the score must stay above the sensitivity before the Echo fires. 1 = a single frame; 2 ignores one-frame spikes out of conversation, which a spoken wake word clears with room to spare" value={config.owwPatienceFrames ?? 1} min={1} max={5} step={1} unit="fr" onChange={v => set('owwPatienceFrames', v)}/>
                <Toggle label="Save wake captures" sub="keeps short clips of activations and near-misses to label and retrain — writes speech to disk; review under Settings → Training" value={config.saveWakeCaptures ?? false} onChange={v => set('saveWakeCaptures', v)}/>
               {(config.saveWakeCaptures ?? false) && (
                 <Slider label="Capture length" sub="seconds of audio before each detection to keep" value={config.wakeCaptureSec ?? 2.0} min={0.5} max={5.0} step={0.5} unit="s" onChange={v => set('wakeCaptureSec', v)}/>

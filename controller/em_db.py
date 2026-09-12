@@ -80,6 +80,13 @@ DEFAULT_DEVICE_CONFIG = {
     # likely ending no_speech. Lower it per device if a custom wake model
     # trades recall for false positives (see oww_forge/README.md).
     "owwThreshold":     0.5,
+    # owwPatienceFrames: consecutive 80ms detector frames that must score at
+    # or above owwThreshold before the device fires (openWakeWord's
+    # "patience"). 1 keeps the single-frame trigger. A spoken wake word holds
+    # the score up for several frames; a one-frame spike out of ordinary
+    # conversation does not, so 2 rejects those without touching the
+    # threshold. Firmware before v2.22.0 ignores the key.
+    "owwPatienceFrames": 1,
     # Barge-in (§3.2, controller-side): wake word spoken during TTS playback
     # cancels it and starts a fresh turn. bargeInThreshold is used as-is,
     # deliberately BELOW the normal wake threshold: the echo at the mic is

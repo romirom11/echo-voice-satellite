@@ -43,6 +43,13 @@ type Device struct {
 
 	// Wake word
 	OwwThreshold float64
+	// OwwPatienceFrames is how many consecutive 80ms detector frames must
+	// score at or above OwwThreshold before the device sends a wake
+	// request (openWakeWord's "patience"). 1 = the historical single-frame
+	// trigger. A real wake word holds the score up for several frames; a
+	// one-frame spike out of conversation does not, so 2 rejects those
+	// without raising the threshold for genuine activations.
+	OwwPatienceFrames int
 	OwwModel     string
 	// BargeInEnabled / BargeInThreshold mirror the controller's barge-in
 	// settings. The device needs them for on-device scoring: while the speaker
@@ -136,6 +143,7 @@ func (d *Device) loadDefaults() {
 	d.LimiterThreshold = -1
 	d.LimiterRelease = 150
 	d.OwwThreshold = envFloat("OWW_THRESHOLD", 0.5)
+	d.OwwPatienceFrames = clampOwwPatienceFrames(envInt("OWW_PATIENCE_FRAMES", DefaultOwwPatienceFrames))
 	d.OwwModel = envStr("OWW_MODEL", "hey_jarvis_v0.1")
 	d.StopModel = envStr("STOP_MODEL", "")
 	d.StopThreshold = envFloat("STOP_THRESHOLD", 0.5)
@@ -174,6 +182,9 @@ func (d *Device) Apply(msg ConfigMessage) {
 	}
 	if msg.VadSilenceMs > 0 {
 		d.VadSilenceMs = msg.VadSilenceMs
+	}
+	if msg.OwwPatienceFrames > 0 {
+		d.OwwPatienceFrames = clampOwwPatienceFrames(msg.OwwPatienceFrames)
 	}
 	if msg.OwwThreshold > 0 {
 		d.OwwThreshold = msg.OwwThreshold
@@ -306,6 +317,7 @@ func (d *Device) Snapshot() ConfigMessage {
 		VadSpeechMs:       d.VadSpeechMs,
 		VadSilenceMs:      d.VadSilenceMs,
 		OwwThreshold:      d.OwwThreshold,
+		OwwPatienceFrames: d.OwwPatienceFrames,
 		OwwModel:          d.OwwModel,
 		StopModel:         &stopModel,
 		StopThreshold:     d.StopThreshold,
@@ -356,6 +368,7 @@ type ConfigMessage struct {
 	VadSpeechMs       int       `json:"vadSpeechMs,omitempty"`
 	VadSilenceMs      int       `json:"vadSilenceMs,omitempty"`
 	OwwThreshold      float64   `json:"owwThreshold,omitempty"`
+	OwwPatienceFrames int       `json:"owwPatienceFrames,omitempty"`
 	OwwModel          string    `json:"owwModel,omitempty"`
 	StopModel         *string   `json:"stopModel,omitempty"`
 	StopThreshold     float64   `json:"stopThreshold,omitempty"`
@@ -407,6 +420,12 @@ func (m ConfigMessage) WakeReplayFrameCount() int {
 }
 
 const (
+	// DefaultOwwPatienceFrames preserves the single-frame trigger.
+	DefaultOwwPatienceFrames = 1
+	// MaxOwwPatienceFrames: 10 frames is 800ms of sustained score, longer
+	// than any wake phrase keeps the classifier up; more would only ever
+	// miss activations.
+	MaxOwwPatienceFrames = 10
 	// DefaultNoSpeechTimeoutMs preserves the historical fixed 5s deadline.
 	DefaultNoSpeechTimeoutMs = 5000
 	// MaxNoSpeechTimeoutMs bounds a misconfigured push: a turn that has
@@ -419,6 +438,17 @@ const (
 	// could never be satisfied and would refuse every wake grant.
 	MaxWakeReplayFrames = 99
 )
+
+// clampOwwPatienceFrames keeps the run length within [1, MaxOwwPatienceFrames].
+func clampOwwPatienceFrames(frames int) int {
+	if frames < 1 {
+		return 1
+	}
+	if frames > MaxOwwPatienceFrames {
+		return MaxOwwPatienceFrames
+	}
+	return frames
+}
 
 // clampNoSpeechTimeoutMs maps negatives to "disabled" and caps the top end.
 func clampNoSpeechTimeoutMs(ms int) int {

@@ -1068,6 +1068,7 @@ func applyWakeConfig(dc *client.DataClient, cc *client.ControlClient,
 	// with the shared head.
 	if sc := dc.ShadowScorer(); sc != nil && wakeState.model == model && wakeState.stopModel == stopModel {
 		sc.SetThreshold(threshold)
+		sc.SetPatience(snap.OwwPatienceFrames)
 		sc.SetScoreCallback(dc.ObserveWakeScore)
 		if snap.BargeInEnabled != nil && *snap.BargeInEnabled && spk != nil {
 			sc.SetBargeThreshold(float32(snap.BargeInThreshold), spk.IsStreaming)
@@ -1125,6 +1126,7 @@ func applyWakeConfig(dc *client.DataClient, cc *client.ControlClient,
 	if snap.BargeInEnabled != nil && *snap.BargeInEnabled && spk != nil {
 		sc.SetBargeThreshold(float32(snap.BargeInThreshold), spk.IsStreaming)
 	}
+	sc.SetPatience(snap.OwwPatienceFrames)
 	sc.SetScoreCallback(dc.ObserveWakeScore)
 	dc.SetShadowScorer(sc)
 	if sharedStop {
