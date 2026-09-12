@@ -111,10 +111,10 @@ type Scorer struct {
 	// two without raising the bar for the real thing.
 	patience int
 	// above counts the consecutive frames at or above the threshold so far.
-	above int
-	onCross        func(score, threshold float32, at time.Time, sequence uint16)
-	onScore        func(ScoreEvent)
-	head           []Head
+	above   int
+	onCross func(score, threshold float32, at time.Time, sequence uint16)
+	onScore func(ScoreEvent)
+	head    []Head
 
 	ch   chan scoredFrame
 	done chan struct{}
