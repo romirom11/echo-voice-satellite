@@ -1,0 +1,20 @@
+# Standalone controller deployment (no Home Assistant add-on).
+# Copy this directory somewhere (e.g. /opt/echomuse), adjust the environment
+# and run `docker compose up -d`. Update with ./update.sh.
+services:
+  controller:
+    image: ghcr.io/romirom11/echomuse-controller:v2.21.0
+    container_name: echomuse
+    restart: unless-stopped
+    network_mode: host          # mDNS + device discovery need the LAN
+    environment:
+      TZ: Europe/Kyiv
+      SERVER_IP: 10.10.0.106    # address devices connect back to
+      MDNS_NAME: echomuse
+      SERVER_TLS_PORT: "0"      # plain control channel on the LAN
+      REQUIRE_DEVICE_TLS: "0"
+      SENDSPIN_ENABLED: "1"
+      MUSIC_ASSISTANT_URL: ws://10.10.0.78:8927/sendspin
+      EM_GITHUB_REPO: romirom11/echo-voice-satellite
+    volumes:
+      - ./data:/app/data

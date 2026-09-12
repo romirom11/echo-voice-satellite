@@ -39,15 +39,20 @@ image agree. Every push to `main` that touches `controller/` also refreshes
 
 ## Updating a Docker deployment
 
+`deploy/` holds a standalone compose file and `update.sh`. Copy both next to
+your `data/` directory (e.g. `/opt/echomuse`) and run:
+
 ```bash
-cd /opt/echomuse          # or wherever docker-compose.yml lives
-docker compose pull
-docker compose up -d
-docker image prune -f
+./update.sh            # newest controller-v* tag on GitHub
+./update.sh v2.22.0    # a specific version
+./update.sh latest     # what main last published (dev channel)
 ```
 
-Device data, users, recordings and TLS material live in `./data` and survive
-the image swap. `update.sh` next to the compose file does exactly this.
+It rewrites the image tag in `docker-compose.yml`, pulls, restarts and prunes
+the old image. Device data, users, recordings and TLS material live in
+`./data` and survive the swap. The pull happens before the restart, so a
+failed download leaves the running controller alone; on a disk too small
+for two images it retries with the container stopped.
 
 ## Updating devices
 
