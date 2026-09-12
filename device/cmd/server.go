@@ -947,6 +947,7 @@ func wifiRSSI() *int {
 func applyOutputChainConfig(spk *speaker.PcmSpeaker) {
 	snap := config.Get().Snapshot()
 	spk.SetOutputChain(outchain.Params{
+		GainDB:             *snap.OutputGainDb,
 		Bands:              snap.EqBands,
 		Loudness:           snap.EqLoudness != nil && *snap.EqLoudness,
 		BassShelfHz:        *snap.BassShelfHz,

@@ -490,3 +490,38 @@ func TestOwwPatienceFramesConfig(t *testing.T) {
 		t.Fatalf("clamp = %d, want %d", d.OwwPatienceFrames, MaxOwwPatienceFrames)
 	}
 }
+
+// TestOutputGainDbConfig: default unity, a push sets it, an absent key
+// leaves it alone, and it is clamped to [0, MaxOutputGainDb].
+func TestOutputGainDbConfig(t *testing.T) {
+	d := &Device{}
+	d.mu.Lock()
+	d.loadDefaults()
+	d.mu.Unlock()
+	if d.OutputGainDb != 0 || *d.Snapshot().OutputGainDb != 0 {
+		t.Fatalf("default = %v, want 0", d.OutputGainDb)
+	}
+
+	var msg ConfigMessage
+	if err := json.Unmarshal([]byte(`{"type":"config","outputGainDb":6}`), &msg); err != nil {
+		t.Fatal(err)
+	}
+	d.Apply(msg)
+	if d.OutputGainDb != 6 || *d.Snapshot().OutputGainDb != 6 {
+		t.Fatalf("after push = %v, want 6", d.OutputGainDb)
+	}
+
+	d.Apply(ConfigMessage{LimiterThreshold: floatPtr(-3)})
+	if d.OutputGainDb != 6 {
+		t.Fatalf("partial push changed the value: %v", d.OutputGainDb)
+	}
+
+	d.Apply(ConfigMessage{OutputGainDb: floatPtr(40)})
+	if d.OutputGainDb != MaxOutputGainDb {
+		t.Fatalf("clamp high = %v, want %v", d.OutputGainDb, MaxOutputGainDb)
+	}
+	d.Apply(ConfigMessage{OutputGainDb: floatPtr(-4)})
+	if d.OutputGainDb != 0 {
+		t.Fatalf("clamp low = %v, want 0", d.OutputGainDb)
+	}
+}

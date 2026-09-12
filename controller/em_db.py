@@ -207,6 +207,13 @@ DEFAULT_DEVICE_CONFIG = {
     "eqBands":          [4.5, 3.0, -0.5, 0.0, 1.5, 1.0, 0.0, 1.5],
     "eqLoudness":       True,
     "ttsGainDb":        0.0,
+    # outputGainDb: makeup gain on the device for EVERYTHING (music and
+    # speech) ahead of the EQ and limiter. The device's volume control tops
+    # out at the codec's 0dB, so Music Assistant at 100% cannot get louder
+    # through volume; with a bass-boosting EQ the limiter then pulls the
+    # midrange down. This buys loudness with dynamics, the limiter holds
+    # the peaks. Firmware before v2.23.0 ignores the key.
+    "outputGainDb":     0.0,
     # Output limiter and dynamic bass guard protect the device after EQ.
     # Dynamic bass guard. Removes low-frequency content the driver cannot
     # deliver, which is what makes the midrange clean — see em_mbc.

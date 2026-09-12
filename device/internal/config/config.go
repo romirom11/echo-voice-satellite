@@ -36,6 +36,11 @@ type Device struct {
 	LimiterEnabled   bool
 	LimiterThreshold float64
 	LimiterRelease   float64
+	// OutputGainDb is a makeup gain on the whole mix ahead of the EQ and
+	// limiter (outchain.Params.GainDB), 0..MaxOutputGainDb. The volume
+	// control stops at the codec's 0dB, so this is the only way a
+	// full-scale source gets louder; the limiter holds the peaks.
+	OutputGainDb float64
 	// SendspinServer is the controller-selected Music Assistant Sendspin URL.
 	// It is deliberately outside the fleet/device settings sections: it is
 	// controller connection metadata, not an audio preference.
@@ -50,7 +55,7 @@ type Device struct {
 	// one-frame spike out of conversation does not, so 2 rejects those
 	// without raising the threshold for genuine activations.
 	OwwPatienceFrames int
-	OwwModel     string
+	OwwModel          string
 	// BargeInEnabled / BargeInThreshold mirror the controller's barge-in
 	// settings. The device needs them for on-device scoring: while the speaker
 	// is streaming, the controller lowers its wake bar to BargeInThreshold
@@ -142,6 +147,7 @@ func (d *Device) loadDefaults() {
 	d.LimiterEnabled = true
 	d.LimiterThreshold = -1
 	d.LimiterRelease = 150
+	d.OutputGainDb = 0
 	d.OwwThreshold = envFloat("OWW_THRESHOLD", 0.5)
 	d.OwwPatienceFrames = clampOwwPatienceFrames(envInt("OWW_PATIENCE_FRAMES", DefaultOwwPatienceFrames))
 	d.OwwModel = envStr("OWW_MODEL", "hey_jarvis_v0.1")
@@ -272,6 +278,9 @@ func (d *Device) Apply(msg ConfigMessage) {
 	if msg.LimiterRelease != nil {
 		d.LimiterRelease = *msg.LimiterRelease
 	}
+	if msg.OutputGainDb != nil {
+		d.OutputGainDb = clampFloat(*msg.OutputGainDb, 0, MaxOutputGainDb)
+	}
 	if msg.SendspinServer != "" {
 		d.SendspinServer = msg.SendspinServer
 	}
@@ -298,6 +307,7 @@ func (d *Device) Snapshot() ConfigMessage {
 	bassGuardDb := d.BassGuardDb
 	limiterEnabled := d.LimiterEnabled
 	limiterThreshold := d.LimiterThreshold
+	outputGainDb := d.OutputGainDb
 	limiterRelease := d.LimiterRelease
 	bargeInEnabled := d.BargeInEnabled
 	saveWakeCaptures := d.SaveWakeCaptures
@@ -340,6 +350,7 @@ func (d *Device) Snapshot() ConfigMessage {
 		BassGuardDb:       &bassGuardDb,
 		LimiterEnabled:    &limiterEnabled,
 		LimiterThreshold:  &limiterThreshold,
+		OutputGainDb:      &outputGainDb,
 		LimiterRelease:    &limiterRelease,
 		SendspinServer:    d.SendspinServer,
 		AfeMicGainDb:      &afeMicGainDb,
@@ -362,6 +373,7 @@ type ConfigMessage struct {
 	BassGuardDb       *float64  `json:"bassGuardDb,omitempty"`
 	LimiterEnabled    *bool     `json:"limiterEnabled,omitempty"`
 	LimiterThreshold  *float64  `json:"limiterThreshold,omitempty"`
+	OutputGainDb      *float64  `json:"outputGainDb,omitempty"`
 	LimiterRelease    *float64  `json:"limiterRelease,omitempty"`
 	SendspinServer    string    `json:"sendspinServer,omitempty"`
 	VadThreshold      float64   `json:"vadThreshold,omitempty"`
@@ -420,6 +432,10 @@ func (m ConfigMessage) WakeReplayFrameCount() int {
 }
 
 const (
+	// MaxOutputGainDb matches the controller's ttsGainDb ceiling: past this
+	// the limiter is working on every period and the result is just
+	// distortion at the same loudness.
+	MaxOutputGainDb = 12.0
 	// DefaultOwwPatienceFrames preserves the single-frame trigger.
 	DefaultOwwPatienceFrames = 1
 	// MaxOwwPatienceFrames: 10 frames is 800ms of sustained score, longer

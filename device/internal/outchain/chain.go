@@ -1,5 +1,7 @@
 package outchain
 
+import "math"
+
 // Chain is the whole output path — EQ, bass guard, limiter — plus the thing
 // the controller-side reference does not have: PARAMETER CHANGES THAT DO NOT
 // CLICK.
@@ -43,6 +45,14 @@ const fadeMS = 40.0
 // already ride the config push and are, until this lands, ignored by the
 // device.
 type Params struct {
+	// GainDB is a makeup gain applied to the whole mix ahead of the EQ, in
+	// the float domain, so nothing clips before the limiter sees it. The
+	// device's volume control tops out at the codec's 0dB (see
+	// server/volume.go), so a source that already sits near full scale can
+	// get no louder through volume alone — every dB of EQ boost is then
+	// paid back by the limiter, and the midrange gets quieter. This is the
+	// same knob the controller applies to TTS (ttsGainDb), for everything.
+	GainDB             float64
 	Bands              []float64
 	Loudness           bool
 	LimiterEnabled     bool
@@ -66,7 +76,8 @@ func (p Params) Equal(o Params) bool {
 			return false
 		}
 	}
-	return p.Loudness == o.Loudness &&
+	return p.GainDB == o.GainDB &&
+		p.Loudness == o.Loudness &&
 		p.LimiterEnabled == o.LimiterEnabled &&
 		p.LimiterThresholdDB == o.LimiterThresholdDB &&
 		p.LimiterReleaseMS == o.LimiterReleaseMS &&
@@ -81,13 +92,22 @@ func (p Params) Equal(o Params) bool {
 // not a cold filter fading in, it is the same filter continuing with different
 // coefficients.
 type stages struct {
+	gain  float64 // linear, 1.0 = unity
 	eq    *EQ
 	guard *BassGuard
 	lim   *Limiter
 }
 
+func linearGain(db float64) float64 {
+	if db == 0 {
+		return 1.0
+	}
+	return math.Pow(10, db/20.0)
+}
+
 func newStages(sampleRate int, p Params) *stages {
 	return &stages{
+		gain: linearGain(p.GainDB),
 		eq: NewEQWithSettings(sampleRate, p.Bands, p.Loudness, true,
 			p.BassShelfHz, p.SubsonicHz),
 		guard: NewBassGuard(sampleRate, p.GuardDB, p.GuardEnabled),
@@ -101,6 +121,11 @@ func newStages(sampleRate int, p Params) *stages {
 // be discarded, pulling the midrange down for no reason — measured at 0.5dB on
 // a 50Hz + 1kHz mix.
 func (s *stages) process(x []float64) []float64 {
+	if s.gain != 1.0 {
+		for i := range x {
+			x[i] *= s.gain
+		}
+	}
 	s.eq.Process(x)
 	s.guard.Process(x)
 	return s.lim.Process(x)
@@ -110,6 +135,7 @@ func (s *stages) process(x []float64) []float64 {
 // the new parameters to the copy.
 func (s *stages) clone(p Params) *stages {
 	c := &stages{
+		gain:  linearGain(p.GainDB),
 		eq:    s.eq.clone(),
 		guard: s.guard.clone(),
 		lim:   s.lim.clone(),

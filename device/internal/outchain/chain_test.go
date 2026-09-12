@@ -404,3 +404,38 @@ func TestParamsEqualCoversEveryField(t *testing.T) {
 		t.Error("Params.Equal says an identical copy differs")
 	}
 }
+
+// TestGainDBScalesTheMixAheadOfTheLimiter: +6dB on a quiet sine doubles it,
+// the gain is part of Params equality (so a change crossfades rather than
+// being ignored), and 0 is exact unity.
+func TestGainDBScalesTheMixAheadOfTheLimiter(t *testing.T) {
+	flat := Params{Bands: make([]float64, NumBands), LimiterThresholdDB: -1,
+		LimiterReleaseMS: 150}
+	boosted := flat
+	boosted.GainDB = 6
+	if flat.Equal(boosted) {
+		t.Fatal("GainDB must take part in Params.Equal")
+	}
+
+	const n = 4800
+	src := make([]float64, n)
+	for i := range src {
+		src[i] = 1000 * math.Sin(2*math.Pi*1000*float64(i)/testRate)
+	}
+	unity := newStages(testRate, flat).process(append([]float64(nil), src...))
+	loud := newStages(testRate, boosted).process(append([]float64(nil), src...))
+
+	peakU, peakL := 0.0, 0.0
+	for i := n / 2; i < n; i++ {
+		peakU = math.Max(peakU, math.Abs(unity[i]))
+		peakL = math.Max(peakL, math.Abs(loud[i]))
+	}
+	// The always-on subsonic high-pass trims a hair even from a 1kHz tone;
+	// 1% is well inside that and far outside a wrong gain.
+	if math.Abs(peakU-1000) > 10 {
+		t.Fatalf("unity chain changed a flat signal: peak %.1f, want ~1000", peakU)
+	}
+	if ratio := peakL / peakU; math.Abs(ratio-1.9953) > 0.02 {
+		t.Fatalf("+6dB gave a ratio of %.3f, want ~1.995", ratio)
+	}
+}

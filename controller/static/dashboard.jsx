@@ -4993,7 +4993,7 @@ const STAGE_MONO = "'DM Mono',monospace";
 // control sitting under a toggle that does not govern it would look fine and
 // be silently wrong.
 const CONFIG_SECTIONS = {
-  "playback": ["eqBands", "eqLoudness", "ttsGainDb", "duckDb", "limiterEnabled", "limiterRelease", "bassGuardEnabled", "bassGuardDb"],
+  "playback": ["eqBands", "eqLoudness", "ttsGainDb", "outputGainDb", "duckDb", "limiterEnabled", "limiterRelease", "bassGuardEnabled", "bassGuardDb"],
   "wakeword": ["owwModel", "owwThreshold", "owwPatienceFrames", "bargeInEnabled", "bargeInThreshold", "wakeArbitrationMs", "noSpeechTimeoutMs", "wakeReplayFrames", "saveWakeCaptures", "wakeCaptureSec", "wakeNearMissFloor"],
   "stopword": ["stopModel", "stopThreshold", "saveStopCaptures", "stopCaptureSec", "stopNearMissFloor"],
   "microphones": ["afeMicGainDb", "saveUtterances"],
@@ -5253,6 +5253,11 @@ function DeviceConfigForm({ config, onChange, disabled, sections, onScopeChange,
               <Slider label="Speech boost" sub="additional gain applied to TTS before the speaker limiter"
                 value={config.ttsGainDb ?? 0} min={0} max={12} step={0.5} unit="dB"
                 disabled={disabled} onChange={v => set('ttsGainDb', v)}/>
+            </div>
+            <div style={inputStyle}>
+              <Slider label="Output boost" sub="gain on the Echo for everything — music and speech — before the EQ and limiter. Volume stops at the codec's 0 dB, so this is what makes a full-scale source louder; the limiter holds the peaks, so it trades dynamics for loudness"
+                value={config.outputGainDb ?? 0} min={0} max={12} step={0.5} unit="dB"
+                disabled={disabled} onChange={v => set('outputGainDb', v)}/>
             </div>
             {/* Speaker protection: ONE toggle for the bass guard here, plus
                 the limiter CEILING in the advanced panel below. The limiter's
